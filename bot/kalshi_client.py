@@ -1,0 +1,250 @@
+"""
+Kalshi REST API v2 client with RSA-PSS authentication.
+
+Every request is signed with:
+  KALSHI-ACCESS-KEY:       API key ID
+  KALSHI-ACCESS-TIMESTAMP: Unix timestamp in milliseconds (string)
+  KALSHI-ACCESS-SIGNATURE: base64(RSA-PSS-SHA256(timestamp_ms + METHOD + /path))
+"""
+import base64
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class Market:
+    ticker: str
+    event_ticker: str
+    status: str
+    close_time: str          # ISO-8601 string
+    yes_ask: float           # dollars (0.01 – 0.99)
+    no_ask: float
+    yes_bid: float
+    no_bid: float
+    last_price: Optional[float]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Market":
+        return cls(
+            ticker=d["ticker"],
+            event_ticker=d.get("event_ticker", ""),
+            status=d.get("status", ""),
+            close_time=d.get("close_time", ""),
+            yes_ask=float(d.get("yes_ask_dollars") or d.get("yes_ask", 0) / 100),
+            no_ask=float(d.get("no_ask_dollars") or d.get("no_ask", 0) / 100),
+            yes_bid=float(d.get("yes_bid_dollars") or d.get("yes_bid", 0) / 100),
+            no_bid=float(d.get("no_bid_dollars") or d.get("no_bid", 0) / 100),
+            last_price=float(d["last_price_dollars"]) if d.get("last_price_dollars") is not None else None,
+        )
+
+
+@dataclass
+class Order:
+    order_id: str
+    client_order_id: Optional[str]
+    ticker: str
+    side: str        # "yes" or "no"
+    action: str      # "buy" or "sell"
+    status: str
+    yes_price: float
+    no_price: float
+    count: int
+    fill_count: int
+    taker_fill_cost: float
+    created_time: str
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Order":
+        return cls(
+            order_id=d.get("order_id", ""),
+            client_order_id=d.get("client_order_id"),
+            ticker=d.get("ticker", ""),
+            side=d.get("side", ""),
+            action=d.get("action", ""),
+            status=d.get("status", ""),
+            yes_price=float(d.get("yes_price_dollars") or 0),
+            no_price=float(d.get("no_price_dollars") or 0),
+            count=int(d.get("initial_count_fp") or 0),
+            fill_count=int(d.get("fill_count_fp") or 0),
+            taker_fill_cost=float(d.get("taker_fill_cost_dollars") or 0),
+            created_time=d.get("created_time", ""),
+        )
+
+
+@dataclass
+class Position:
+    ticker: str
+    side: str           # "yes" or "no"
+    quantity: int
+    cost: float
+
+
+class KalshiClient:
+    def __init__(self, api_key_id: str, private_key_path: Path, base_url: str):
+        self._api_key_id = api_key_id
+        self._base_url = base_url.rstrip("/")
+        self._private_key = self._load_key(private_key_path)
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
+
+    # ------------------------------------------------------------------
+    # Auth
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_key(path: Path):
+        pem = Path(path).read_bytes()
+        return serialization.load_pem_private_key(pem, password=None)
+
+    def _sign(self, method: str, path: str) -> dict:
+        """Return the three auth headers required by every Kalshi request."""
+        ts_ms = str(int(time.time() * 1000))
+        msg = (ts_ms + method.upper() + path).encode("utf-8")
+        sig = self._private_key.sign(
+            msg,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return {
+            "KALSHI-ACCESS-KEY": self._api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+        }
+
+    def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        headers = self._sign("GET", path)
+        url = self._base_url + path
+        resp = self._session.get(url, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _post(self, path: str, body: dict) -> Any:
+        headers = self._sign("POST", path)
+        url = self._base_url + path
+        resp = self._session.post(url, headers=headers, json=body, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Markets
+    # ------------------------------------------------------------------
+
+    def get_open_btc_markets(self) -> list[Market]:
+        """Return all open Kalshi BTC daily price-level markets (series KXBTC)."""
+        path = "/trade-api/v2/markets"
+        data = self._get(path, params={"series_ticker": "KXBTC", "status": "open"})
+        markets = [Market.from_dict(m) for m in data.get("markets", [])]
+        log.debug("Found %d open KXBTC markets", len(markets))
+        return markets
+
+    def get_market(self, ticker: str) -> Market:
+        path = f"/trade-api/v2/markets/{ticker}"
+        data = self._get(path)
+        return Market.from_dict(data.get("market", data))
+
+    # ------------------------------------------------------------------
+    # Portfolio
+    # ------------------------------------------------------------------
+
+    def get_balance(self) -> float:
+        """Return available balance in USD."""
+        path = "/trade-api/v2/portfolio/balance"
+        data = self._get(path)
+        balance = float(data.get("balance", data.get("available_balance", 0)))
+        log.debug("Account balance: %.2f", balance)
+        return balance
+
+    def get_positions(self) -> list[Position]:
+        """Return all non-zero positions."""
+        path = "/trade-api/v2/portfolio/positions"
+        data = self._get(path, params={"filter_by_non_zero": "true"})
+        positions = []
+        for p in data.get("market_positions", []):
+            qty_yes = int(p.get("position", 0))
+            qty_no = int(p.get("no_position", 0))
+            if qty_yes > 0:
+                positions.append(Position(
+                    ticker=p["ticker"],
+                    side="yes",
+                    quantity=qty_yes,
+                    cost=float(p.get("cost_basis_yes_dollars", 0)),
+                ))
+            if qty_no > 0:
+                positions.append(Position(
+                    ticker=p["ticker"],
+                    side="no",
+                    quantity=qty_no,
+                    cost=float(p.get("cost_basis_no_dollars", 0)),
+                ))
+        log.debug("Open positions: %d", len(positions))
+        return positions
+
+    # ------------------------------------------------------------------
+    # Orders
+    # ------------------------------------------------------------------
+
+    def place_order(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        price_dollars: float,
+        client_order_id: Optional[str] = None,
+    ) -> Order:
+        """
+        Place a limit buy order.
+
+        Args:
+            ticker:          Kalshi market ticker
+            side:            "yes" or "no"
+            count:           Number of contracts
+            price_dollars:   Limit price in dollars (0.01 – 0.99)
+            client_order_id: Optional idempotency key
+        """
+        body: dict[str, Any] = {
+            "ticker": ticker,
+            "side": side,
+            "action": "buy",
+            "type": "limit",
+            "count": count,
+        }
+        # Send price as cents integer (Kalshi accepts 1–99)
+        price_cents = max(1, min(99, round(price_dollars * 100)))
+        if side == "yes":
+            body["yes_price"] = price_cents
+        else:
+            body["no_price"] = price_cents
+
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+
+        path = "/trade-api/v2/portfolio/orders"
+        data = self._post(path, body)
+        order = Order.from_dict(data.get("order", data))
+        log.info(
+            "Order placed: %s %s %s x%d @ $%.2f → id=%s status=%s",
+            ticker, side, "buy", count, price_dollars, order.order_id, order.status,
+        )
+        return order
+
+    def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> list[Order]:
+        path = "/trade-api/v2/portfolio/orders"
+        params: dict = {}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        data = self._get(path, params=params)
+        return [Order.from_dict(o) for o in data.get("orders", [])]

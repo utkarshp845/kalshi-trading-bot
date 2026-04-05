@@ -1,0 +1,22 @@
+# Environment & secrets
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Runtime data
+data/
+logs/
+
+# IDE
+.vscode/
+.idea/
