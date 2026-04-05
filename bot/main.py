@@ -77,7 +77,7 @@ log = logging.getLogger(__name__)
 
 def run(dry_run: bool) -> None:
     _setup_logging()
-    log.info("=== Kalshi BTC Bot starting (dry_run=%s) ===", dry_run)
+    log.info("=== Kalshi BTC Bot starting (dry_run=%s) — v1.0.1 ===", dry_run)
 
     if not cfg.KALSHI_API_KEY_ID:
         log.error("KALSHI_API_KEY_ID is not set. Copy .env.example to .env and fill in your credentials.")
