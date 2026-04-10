@@ -34,10 +34,13 @@ KALSHI_PRIVATE_KEY_PATH: Path = Path(_require("KALSHI_PRIVATE_KEY_PATH"))
 KALSHI_BASE_URL: str = os.getenv(
     "KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"
 )
+KALSHI_TAKER_FEE: float = _float("KALSHI_TAKER_FEE", 0.07)  # dollars per contract
 
 # --- Strategy ---
 MIN_EDGE: float = _float("MIN_EDGE", 0.08)
 MIN_T_HOURS: float = _float("MIN_T_HOURS", 0.5)
+VOL_SHORT_DAYS: int = _int("VOL_SHORT_DAYS", 7)   # fast vol: used for signal probability
+VOL_LONG_DAYS: int = _int("VOL_LONG_DAYS", 30)    # slow vol: logged as regime reference
 
 # --- Risk ---
 MAX_DAILY_SPEND: float = _float("MAX_DAILY_SPEND", 100.0)

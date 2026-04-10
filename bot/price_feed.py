@@ -68,8 +68,24 @@ def get_realized_vol(lookback_days: int = 30) -> float:
     return annual_vol
 
 
-def get_btc_price_and_vol(lookback_days: int = 30) -> tuple[float, float]:
-    """Convenience: return (spot_price, annualized_vol) together."""
+def get_btc_price_and_vol(
+    short_days: int = 7,
+    long_days: int = 30,
+) -> tuple[float, float, float]:
+    """
+    Return (spot_price, sigma_short, sigma_long).
+
+    sigma_short: realized vol over the last `short_days` days — responsive to
+                 current regime, used for signal probability calculation.
+    sigma_long:  realized vol over the last `long_days` days — stable baseline,
+                 logged as a regime reference.
+    """
     price = get_spot_price()
-    sigma = get_realized_vol(lookback_days)
-    return price, sigma
+    sigma_short = get_realized_vol(short_days)
+    sigma_long = get_realized_vol(long_days)
+    log.info(
+        "Vol: %d-day=%.4f  %d-day=%.4f  (ratio %.2fx)",
+        short_days, sigma_short, long_days, sigma_long,
+        sigma_short / sigma_long if sigma_long > 0 else 0,
+    )
+    return price, sigma_short, sigma_long

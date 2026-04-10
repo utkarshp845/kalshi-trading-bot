@@ -136,13 +136,32 @@ def run(dry_run: bool) -> None:
         log.info("=== Bot stopped ===")
 
 
+def _check_fills(kalshi: KalshiClient, store: Store) -> None:
+    """Re-fetch open orders from Kalshi and update fill quality metrics in the DB."""
+    order_ids = store.get_unfilled_orders()
+    if not order_ids:
+        return
+    for order_id in order_ids:
+        try:
+            order = kalshi.get_order(order_id)
+            store.update_order_fill(order)
+        except Exception as e:
+            log.warning("Could not check fill for %s: %s", order_id[:8], e)
+
+
 def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: bool) -> None:
     log.info("--- Cycle start ---")
     orders_placed = 0
 
     try:
-        spot_price, sigma = get_btc_price_and_vol()
-        log.info("BTC spot=%.2f  σ=%.4f", spot_price, sigma)
+        spot_price, sigma_short, sigma_long = get_btc_price_and_vol(
+            short_days=cfg.VOL_SHORT_DAYS,
+            long_days=cfg.VOL_LONG_DAYS,
+        )
+        log.info(
+            "BTC spot=%.2f  σ_%dd=%.4f  σ_%dd=%.4f",
+            spot_price, cfg.VOL_SHORT_DAYS, sigma_short, cfg.VOL_LONG_DAYS, sigma_long,
+        )
     except Exception as e:
         log.error("Price feed error: %s", e)
         return
@@ -155,16 +174,20 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         log.error("Kalshi API error: %s", e)
         return
 
+    # Check fill quality for any orders placed in the past 48h that aren't fully filled
+    _check_fills(kalshi, store)
+
     held_tickers = {p.ticker for p in positions}
     open_count = len(positions)
 
     signals = scan_markets(
         markets=markets,
         spot_price=spot_price,
-        sigma=sigma,
+        sigma=sigma_short,
         min_edge=cfg.MIN_EDGE,
         min_t_hours=cfg.MIN_T_HOURS,
         held_tickers=held_tickers,
+        fee=cfg.KALSHI_TAKER_FEE,
     )
 
     for sig in signals:
@@ -178,8 +201,9 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
 
         cost_estimate = contracts * sig.price
         log.info(
-            "SIGNAL %s %s: theo=%.4f ask=%.2f edge=%.4f  →  %d contracts (~$%.2f)%s",
-            sig.ticker, sig.side, sig.theo_prob, sig.price, sig.edge,
+            "SIGNAL %s %s: theo=%.4f ask=%.2f gross_edge=%.4f net_edge=%.4f fee=%.2f  →  %d contracts (~$%.2f)%s",
+            sig.ticker, sig.side, sig.theo_prob, sig.price,
+            sig.gross_edge, sig.edge, sig.fee,
             contracts, cost_estimate, "  [DRY RUN]" if dry_run else "",
         )
 
@@ -194,7 +218,13 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 price_dollars=sig.price,
             )
             risk.record_fill(order.taker_fill_cost or cost_estimate)
-            store.log_order(order, theo_prob=sig.theo_prob, edge=sig.edge)
+            store.log_order(
+                order,
+                theo_prob=sig.theo_prob,
+                gross_edge=sig.gross_edge,
+                edge=sig.edge,
+                fee=sig.fee,
+            )
             open_count += 1
             orders_placed += 1
             time.sleep(0.5)  # avoid burst rate-limiting
@@ -204,7 +234,8 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     store.snapshot_daily(balance, risk.daily_spent, open_count)
     store.log_run(
         btc_price=spot_price,
-        sigma=sigma,
+        sigma_short=sigma_short,
+        sigma_long=sigma_long,
         markets_scanned=len(markets),
         signals_found=len(signals),
         orders_placed=orders_placed,

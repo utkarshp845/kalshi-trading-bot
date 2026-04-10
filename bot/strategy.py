@@ -27,7 +27,9 @@ class Signal:
     ticker: str
     side: str         # "yes" (buy YES) or "no" (buy NO)
     price: float      # ask price to pay (dollars)
-    edge: float       # theoretical edge (0–1)
+    gross_edge: float # edge before fees
+    edge: float       # net edge after taker fee
+    fee: float        # taker fee deducted (dollars per contract)
     theo_prob: float
     strike: float
 
@@ -57,6 +59,7 @@ def evaluate(
     sigma: float,
     min_edge: float,
     min_t_hours: float,
+    fee: float = 0.0,
 ) -> Optional["Signal"]:
     """
     Evaluate one Kalshi market and return a Signal if an edge exists, else None.
@@ -64,9 +67,10 @@ def evaluate(
     Args:
         market:      The Kalshi market to evaluate
         spot_price:  Current BTC/USD spot price
-        sigma:       Annualized realized volatility
-        min_edge:    Minimum edge threshold to act (e.g. 0.08)
+        sigma:       Annualized realized volatility (short-window, e.g. 7-day)
+        min_edge:    Minimum NET edge threshold to act (e.g. 0.08)
         min_t_hours: Skip markets expiring sooner than this (e.g. 0.5)
+        fee:         Taker fee in dollars per contract (deducted from edge)
     """
     strike = _parse_strike(market.ticker)
     if strike is None:
@@ -81,25 +85,32 @@ def evaluate(
     T_years = T_hours / 8760.0
     theo_prob = calc_prob(spot_price, strike, T_years, sigma)
 
-    # Edge = theoretical value of the contract minus what we'd pay (the ask)
-    edge_yes = theo_prob - market.yes_ask
-    edge_no = (1.0 - theo_prob) - market.no_ask
+    # Gross edge = theoretical value minus ask price
+    # Net edge = gross edge minus taker fee (fee is per contract in dollar terms)
+    gross_yes = theo_prob - market.yes_ask
+    gross_no = (1.0 - theo_prob) - market.no_ask
+    net_yes = gross_yes - fee
+    net_no = gross_no - fee
 
     log.debug(
-        "%s K=%.0f S=%.0f T=%.2fh σ=%.4f → theo=%.4f  yes_ask=%.2f (edge %.4f)  no_ask=%.2f (edge %.4f)",
-        market.ticker, strike, spot_price, T_hours, sigma,
-        theo_prob, market.yes_ask, edge_yes, market.no_ask, edge_no,
+        "%s K=%.0f S=%.0f T=%.2fh σ=%.4f → theo=%.4f  "
+        "yes_ask=%.2f (gross %.4f net %.4f)  no_ask=%.2f (gross %.4f net %.4f)",
+        market.ticker, strike, spot_price, T_hours, sigma, theo_prob,
+        market.yes_ask, gross_yes, net_yes, market.no_ask, gross_no, net_no,
     )
 
     best_side: Optional[str] = None
-    best_edge = min_edge  # must exceed threshold
+    best_gross = -999.0
+    best_net = min_edge  # net edge must exceed threshold
 
-    if edge_yes > best_edge:
+    if net_yes > best_net:
         best_side = "yes"
-        best_edge = edge_yes
-    if edge_no > best_edge:
+        best_net = net_yes
+        best_gross = gross_yes
+    if net_no > best_net:
         best_side = "no"
-        best_edge = edge_no
+        best_net = net_no
+        best_gross = gross_no
 
     if best_side is None:
         return None
@@ -110,7 +121,9 @@ def evaluate(
         ticker=market.ticker,
         side=best_side,
         price=ask_price,
-        edge=best_edge,
+        gross_edge=best_gross,
+        edge=best_net,
+        fee=fee,
         theo_prob=theo_prob,
         strike=strike,
     )
@@ -123,9 +136,10 @@ def scan_markets(
     min_edge: float,
     min_t_hours: float,
     held_tickers: set[str],
+    fee: float = 0.0,
 ) -> list[Signal]:
     """
-    Evaluate all markets and return signals sorted by edge (highest first).
+    Evaluate all markets and return signals sorted by net edge (highest first).
     Markets already held are skipped.
     """
     signals = []
@@ -133,7 +147,7 @@ def scan_markets(
         if market.ticker in held_tickers:
             log.debug("Skipping %s: already held", market.ticker)
             continue
-        sig = evaluate(market, spot_price, sigma, min_edge, min_t_hours)
+        sig = evaluate(market, spot_price, sigma, min_edge, min_t_hours, fee=fee)
         if sig:
             signals.append(sig)
 

@@ -249,6 +249,11 @@ class KalshiClient:
         )
         return order
 
+    def get_order(self, order_id: str) -> Order:
+        path = f"/portfolio/orders/{order_id}"
+        data = self._get(path)
+        return Order.from_dict(data.get("order", data))
+
     def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> list[Order]:
         path = "/portfolio/orders"
         params: dict = {}
