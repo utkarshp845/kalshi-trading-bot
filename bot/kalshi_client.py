@@ -74,8 +74,8 @@ class Order:
             status=d.get("status", ""),
             yes_price=float(d.get("yes_price_dollars") or 0),
             no_price=float(d.get("no_price_dollars") or 0),
-            count=int(d.get("initial_count_fp") or 0),
-            fill_count=int(d.get("fill_count_fp") or 0),
+            count=int(float(d.get("initial_count_fp") or 0)),
+            fill_count=int(float(d.get("fill_count_fp") or 0)),
             taker_fill_cost=float(d.get("taker_fill_cost_dollars") or 0),
             created_time=d.get("created_time", ""),
         )
@@ -125,19 +125,27 @@ class KalshiClient:
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
         }
 
-    def _get(self, path: str, params: Optional[dict] = None) -> Any:
-        headers = self._sign("GET", self._base_path + path)
+    def _request(self, method: str, path: str, params=None, body=None) -> Any:
         url = self._base_url + path
-        resp = self._session.get(url, headers=headers, params=params, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(4):
+            headers = self._sign(method, self._base_path + path)
+            resp = self._session.request(
+                method, url, headers=headers, params=params, json=body, timeout=15
+            )
+            if resp.status_code == 429:
+                wait = 2 ** attempt
+                log.warning("Rate limited (429) on %s %s — retrying in %ds", method, path, wait)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        resp.raise_for_status()  # raise after exhausting retries
+
+    def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        return self._request("GET", path, params=params)
 
     def _post(self, path: str, body: dict) -> Any:
-        headers = self._sign("POST", self._base_path + path)
-        url = self._base_url + path
-        resp = self._session.post(url, headers=headers, json=body, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request("POST", path, body=body)
 
     # ------------------------------------------------------------------
     # Markets

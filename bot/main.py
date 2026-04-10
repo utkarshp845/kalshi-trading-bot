@@ -197,6 +197,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
             store.log_order(order, theo_prob=sig.theo_prob, edge=sig.edge)
             open_count += 1
             orders_placed += 1
+            time.sleep(0.5)  # avoid burst rate-limiting
         except Exception as e:
             log.error("Order failed for %s: %s", sig.ticker, e)
 
