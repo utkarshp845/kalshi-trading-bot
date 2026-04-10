@@ -121,7 +121,7 @@ def run(dry_run: bool) -> None:
                 today_date = date.today()
                 risk.reset()
 
-            if not _is_trading_hours():
+            if not cfg.FORCE_TRADING_HOURS and not _is_trading_hours():
                 log.info("Outside trading hours — sleeping %ds", cfg.POLL_INTERVAL_SECONDS)
                 time.sleep(cfg.POLL_INTERVAL_SECONDS)
                 continue

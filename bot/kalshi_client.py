@@ -143,14 +143,14 @@ class KalshiClient:
 
     def get_open_btc_markets(self) -> list[Market]:
         """Return all open Kalshi BTC daily price-level markets (series KXBTC)."""
-        path = "/trade-api/v2/markets"
+        path = "/markets"
         data = self._get(path, params={"series_ticker": "KXBTC", "status": "open"})
         markets = [Market.from_dict(m) for m in data.get("markets", [])]
         log.debug("Found %d open KXBTC markets", len(markets))
         return markets
 
     def get_market(self, ticker: str) -> Market:
-        path = f"/trade-api/v2/markets/{ticker}"
+        path = f"/markets/{ticker}"
         data = self._get(path)
         return Market.from_dict(data.get("market", data))
 
@@ -160,7 +160,7 @@ class KalshiClient:
 
     def get_balance(self) -> float:
         """Return available balance in USD."""
-        path = "/trade-api/v2/portfolio/balance"
+        path = "/portfolio/balance"
         data = self._get(path)
         balance = float(data.get("balance", data.get("available_balance", 0)))
         log.debug("Account balance: %.2f", balance)
@@ -168,7 +168,7 @@ class KalshiClient:
 
     def get_positions(self) -> list[Position]:
         """Return all non-zero positions."""
-        path = "/trade-api/v2/portfolio/positions"
+        path = "/portfolio/positions"
         data = self._get(path, params={"filter_by_non_zero": "true"})
         positions = []
         for p in data.get("market_positions", []):
@@ -230,7 +230,7 @@ class KalshiClient:
         if client_order_id:
             body["client_order_id"] = client_order_id
 
-        path = "/trade-api/v2/portfolio/orders"
+        path = "/portfolio/orders"
         data = self._post(path, body)
         order = Order.from_dict(data.get("order", data))
         log.info(
@@ -240,7 +240,7 @@ class KalshiClient:
         return order
 
     def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> list[Order]:
-        path = "/trade-api/v2/portfolio/orders"
+        path = "/portfolio/orders"
         params: dict = {}
         if ticker:
             params["ticker"] = ticker

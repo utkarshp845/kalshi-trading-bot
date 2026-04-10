@@ -48,6 +48,7 @@ KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.25)
 # --- Execution ---
 POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 300)
 DRY_RUN: bool = _bool("DRY_RUN", False)
+FORCE_TRADING_HOURS: bool = _bool("FORCE_TRADING_HOURS", False)
 
 # --- Paths ---
 BASE_DIR = Path(__file__).resolve().parent.parent
