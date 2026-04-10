@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -92,6 +93,7 @@ class KalshiClient:
     def __init__(self, api_key_id: str, private_key_path: Path, base_url: str):
         self._api_key_id = api_key_id
         self._base_url = base_url.rstrip("/")
+        self._base_path = urlparse(self._base_url).path  # e.g. "/trade-api/v2"
         self._private_key = self._load_key(private_key_path)
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
@@ -124,14 +126,14 @@ class KalshiClient:
         }
 
     def _get(self, path: str, params: Optional[dict] = None) -> Any:
-        headers = self._sign("GET", path)
+        headers = self._sign("GET", self._base_path + path)
         url = self._base_url + path
         resp = self._session.get(url, headers=headers, params=params, timeout=15)
         resp.raise_for_status()
         return resp.json()
 
     def _post(self, path: str, body: dict) -> Any:
-        headers = self._sign("POST", path)
+        headers = self._sign("POST", self._base_path + path)
         url = self._base_url + path
         resp = self._session.post(url, headers=headers, json=body, timeout=15)
         resp.raise_for_status()
