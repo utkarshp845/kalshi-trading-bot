@@ -37,19 +37,25 @@ KALSHI_BASE_URL: str = os.getenv(
 KALSHI_TAKER_FEE: float = _float("KALSHI_TAKER_FEE", 0.07)  # dollars per contract
 
 # --- Strategy ---
-MIN_EDGE: float = _float("MIN_EDGE", 0.08)
-MIN_T_HOURS: float = _float("MIN_T_HOURS", 0.5)
-VOL_SHORT_DAYS: int = _int("VOL_SHORT_DAYS", 7)   # fast vol: used for signal probability
-VOL_LONG_DAYS: int = _int("VOL_LONG_DAYS", 30)    # slow vol: logged as regime reference
+MIN_EDGE: float = _float("MIN_EDGE", 0.15)          # was 0.08 — raised to require stronger edges
+MIN_T_HOURS: float = _float("MIN_T_HOURS", 1.0)     # was 0.5 — avoid noisy near-expiry markets
+VOL_SHORT_DAYS: int = _int("VOL_SHORT_DAYS", 7)      # fast vol: used for signal probability
+VOL_LONG_DAYS: int = _int("VOL_LONG_DAYS", 30)       # slow vol: logged as regime reference
+VOL_SAFETY_MARGIN: float = _float("VOL_SAFETY_MARGIN", 1.25)  # inflate vol estimate by 25% to account for implied > realized
+MAX_VOL_RATIO: float = _float("MAX_VOL_RATIO", 1.8)  # skip trading when short/long vol ratio exceeds this (unstable regime)
+MIN_BID_ASK_SPREAD: float = _float("MIN_BID_ASK_SPREAD", 0.0)   # minimum acceptable bid (liquidity filter)
+MAX_BID_ASK_SPREAD: float = _float("MAX_BID_ASK_SPREAD", 0.25)  # skip markets where ask-bid > this (wide spread = phantom edge)
 
 # --- Risk ---
-MAX_DAILY_SPEND: float = _float("MAX_DAILY_SPEND", 100.0)
-MAX_CONTRACTS_PER_MARKET: int = _int("MAX_CONTRACTS_PER_MARKET", 10)
-MAX_POSITIONS: int = _int("MAX_POSITIONS", 5)
-KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.25)
+MAX_DAILY_SPEND: float = _float("MAX_DAILY_SPEND", 5.0)   # was 100 — protect small bankrolls
+MAX_CONTRACTS_PER_MARKET: int = _int("MAX_CONTRACTS_PER_MARKET", 3)  # was 10
+MAX_POSITIONS: int = _int("MAX_POSITIONS", 2)              # was 5 — fewer correlated positions
+KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.10)    # was 0.25 — much more conservative
+MAX_DRAWDOWN_PCT: float = _float("MAX_DRAWDOWN_PCT", 0.20)  # stop trading if account drops 20% from session start
+BANKROLL_FRACTION: float = _float("BANKROLL_FRACTION", 0.25)  # never risk more than 25% of actual balance per day
 
 # --- Execution ---
-POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 300)
+POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 120)  # was 300 — react faster to opportunities
 DRY_RUN: bool = _bool("DRY_RUN", False)
 FORCE_TRADING_HOURS: bool = _bool("FORCE_TRADING_HOURS", False)
 

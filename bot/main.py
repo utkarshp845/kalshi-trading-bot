@@ -79,10 +79,14 @@ def run(dry_run: bool) -> None:
     _setup_logging()
     log.info("=== Kalshi BTC Bot starting (dry_run=%s) — v1.1.0 ===", dry_run)
     log.info(
-        "Config: min_edge=%.2f  min_t_hours=%.1f  max_daily_spend=$%.0f  "
-        "max_positions=%d  kelly=%.2f  poll=%ds",
+        "Config: min_edge=%.2f  min_t_hours=%.1f  max_daily_spend=$%.1f  "
+        "max_positions=%d  kelly=%.2f  vol_margin=%.2f  max_vol_ratio=%.1f  "
+        "max_spread=%.2f  drawdown_limit=%.0f%%  bankroll_frac=%.0f%%  poll=%ds",
         cfg.MIN_EDGE, cfg.MIN_T_HOURS, cfg.MAX_DAILY_SPEND,
-        cfg.MAX_POSITIONS, cfg.KELLY_FRACTION, cfg.POLL_INTERVAL_SECONDS,
+        cfg.MAX_POSITIONS, cfg.KELLY_FRACTION, cfg.VOL_SAFETY_MARGIN,
+        cfg.MAX_VOL_RATIO, cfg.MAX_BID_ASK_SPREAD,
+        cfg.MAX_DRAWDOWN_PCT * 100, cfg.BANKROLL_FRACTION * 100,
+        cfg.POLL_INTERVAL_SECONDS,
     )
 
     if not cfg.KALSHI_API_KEY_ID:
@@ -103,6 +107,8 @@ def run(dry_run: bool) -> None:
         max_contracts_per_market=cfg.MAX_CONTRACTS_PER_MARKET,
         max_positions=cfg.MAX_POSITIONS,
         kelly_fraction=cfg.KELLY_FRACTION,
+        max_drawdown_pct=cfg.MAX_DRAWDOWN_PCT,
+        bankroll_fraction=cfg.BANKROLL_FRACTION,
     )
 
     store = Store(db_path=cfg.DB_PATH, trades_csv_path=cfg.TRADES_CSV)
@@ -166,12 +172,35 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         log.error("Price feed error: %s", e)
         return
 
+    # Vol regime check: skip trading in unstable regimes where model is unreliable
+    vol_ratio = sigma_short / sigma_long if sigma_long > 0 else 1.0
+    if vol_ratio > cfg.MAX_VOL_RATIO:
+        log.warning(
+            "VOL REGIME SKIP: σ_short/σ_long = %.2f exceeds max %.2f — model unreliable, skipping cycle",
+            vol_ratio, cfg.MAX_VOL_RATIO,
+        )
+        return
+
+    # Apply vol safety margin: inflate realized vol to partially account for
+    # implied vol being higher than realized vol (market makers price in events)
+    sigma_adjusted = sigma_short * cfg.VOL_SAFETY_MARGIN
+    log.info("Vol adjusted: %.4f → %.4f (safety margin %.0f%%)", sigma_short, sigma_adjusted, (cfg.VOL_SAFETY_MARGIN - 1) * 100)
+
     try:
         markets = kalshi.get_open_btc_markets()
         positions = kalshi.get_positions()
         balance = kalshi.get_balance()
     except Exception as e:
         log.error("Kalshi API error: %s", e)
+        return
+
+    # Set session start balance for drawdown tracking
+    risk.set_session_balance(balance)
+
+    # Drawdown guard: stop trading if account has dropped too much
+    if risk.check_drawdown(balance):
+        log.warning("Drawdown limit reached — halting all trading for today")
+        store.snapshot_daily(balance, risk.daily_spent, len(positions))
         return
 
     # Check fill quality for any orders placed in the past 48h that aren't fully filled
@@ -183,28 +212,29 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     signals = scan_markets(
         markets=markets,
         spot_price=spot_price,
-        sigma=sigma_short,
+        sigma=sigma_adjusted,
         min_edge=cfg.MIN_EDGE,
         min_t_hours=cfg.MIN_T_HOURS,
         held_tickers=held_tickers,
         fee=cfg.KALSHI_TAKER_FEE,
+        max_bid_ask_spread=cfg.MAX_BID_ASK_SPREAD,
     )
 
     for sig in signals:
         if not risk.can_trade(open_count):
             break
 
-        contracts = risk.size_order(sig)
+        contracts = risk.size_order(sig, current_balance=balance, open_positions=open_count)
         if contracts < 1:
             log.info("Signal %s %s: sized to 0 contracts, skipping", sig.ticker, sig.side)
             continue
 
         cost_estimate = contracts * sig.price
         log.info(
-            "SIGNAL %s %s: theo=%.4f ask=%.2f gross_edge=%.4f net_edge=%.4f fee=%.2f  →  %d contracts (~$%.2f)%s",
+            "SIGNAL %s %s: theo=%.4f ask=%.2f gross_edge=%.4f net_edge=%.4f fee=%.2f  →  %d contracts (~$%.2f)  balance=$%.2f%s",
             sig.ticker, sig.side, sig.theo_prob, sig.price,
             sig.gross_edge, sig.edge, sig.fee,
-            contracts, cost_estimate, "  [DRY RUN]" if dry_run else "",
+            contracts, cost_estimate, balance, "  [DRY RUN]" if dry_run else "",
         )
 
         if dry_run:
@@ -217,7 +247,9 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 count=contracts,
                 price_dollars=sig.price,
             )
-            risk.record_fill(order.taker_fill_cost or cost_estimate)
+            fill_cost = order.taker_fill_cost or cost_estimate
+            risk.record_fill(fill_cost)
+            balance -= fill_cost  # update running balance for subsequent sizing
             store.log_order(
                 order,
                 theo_prob=sig.theo_prob,

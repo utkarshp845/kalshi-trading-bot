@@ -60,17 +60,19 @@ def evaluate(
     min_edge: float,
     min_t_hours: float,
     fee: float = 0.0,
+    max_bid_ask_spread: float = 0.25,
 ) -> Optional["Signal"]:
     """
     Evaluate one Kalshi market and return a Signal if an edge exists, else None.
 
     Args:
-        market:      The Kalshi market to evaluate
-        spot_price:  Current BTC/USD spot price
-        sigma:       Annualized realized volatility (short-window, e.g. 7-day)
-        min_edge:    Minimum NET edge threshold to act (e.g. 0.08)
-        min_t_hours: Skip markets expiring sooner than this (e.g. 0.5)
-        fee:         Taker fee in dollars per contract (deducted from edge)
+        market:             The Kalshi market to evaluate
+        spot_price:         Current BTC/USD spot price
+        sigma:              Annualized realized volatility (already safety-margin adjusted)
+        min_edge:           Minimum NET edge threshold to act (e.g. 0.15)
+        min_t_hours:        Skip markets expiring sooner than this (e.g. 1.0)
+        fee:                Taker fee in dollars per contract (deducted from edge)
+        max_bid_ask_spread: Skip markets with bid-ask spread wider than this
     """
     strike = _parse_strike(market.ticker)
     if strike is None:
@@ -80,6 +82,13 @@ def evaluate(
     T_hours = _hours_to_expiry(market.close_time)
     if T_hours < min_t_hours:
         log.debug("Skipping %s: T=%.2fh < min %.2fh", market.ticker, T_hours, min_t_hours)
+        return None
+
+    # Bid-ask spread filter: wide spreads signal illiquidity and phantom edges
+    yes_spread = market.yes_ask - market.yes_bid
+    no_spread = market.no_ask - market.no_bid
+    if yes_spread > max_bid_ask_spread and no_spread > max_bid_ask_spread:
+        log.debug("Skipping %s: spreads too wide (yes=%.2f, no=%.2f)", market.ticker, yes_spread, no_spread)
         return None
 
     T_years = T_hours / 8760.0
@@ -103,11 +112,12 @@ def evaluate(
     best_gross = -999.0
     best_net = min_edge  # net edge must exceed threshold
 
-    if net_yes > best_net:
+    # Only consider a side if its spread is acceptable
+    if net_yes > best_net and yes_spread <= max_bid_ask_spread:
         best_side = "yes"
         best_net = net_yes
         best_gross = gross_yes
-    if net_no > best_net:
+    if net_no > best_net and no_spread <= max_bid_ask_spread:
         best_side = "no"
         best_net = net_no
         best_gross = gross_no
@@ -137,6 +147,7 @@ def scan_markets(
     min_t_hours: float,
     held_tickers: set[str],
     fee: float = 0.0,
+    max_bid_ask_spread: float = 0.25,
 ) -> list[Signal]:
     """
     Evaluate all markets and return signals sorted by net edge (highest first).
@@ -147,7 +158,10 @@ def scan_markets(
         if market.ticker in held_tickers:
             log.debug("Skipping %s: already held", market.ticker)
             continue
-        sig = evaluate(market, spot_price, sigma, min_edge, min_t_hours, fee=fee)
+        sig = evaluate(
+            market, spot_price, sigma, min_edge, min_t_hours,
+            fee=fee, max_bid_ask_spread=max_bid_ask_spread,
+        )
         if sig:
             signals.append(sig)
 
