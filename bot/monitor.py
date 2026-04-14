@@ -29,7 +29,12 @@ def alert(message: str, level: str = "ERROR") -> None:
     if not cfg.ALERT_WEBHOOK_URL:
         return
 
-    payload = {"text": f"[kalshi-bot] {level}: {message}"}
+    # Discord uses "content"; Slack uses "text"
+    url = cfg.ALERT_WEBHOOK_URL
+    if "discord.com" in url:
+        payload = {"content": f"**[kalshi-bot] {level}:** {message}"}
+    else:
+        payload = {"text": f"[kalshi-bot] {level}: {message}"}
     try:
         resp = requests.post(cfg.ALERT_WEBHOOK_URL, json=payload, timeout=5)
         resp.raise_for_status()
