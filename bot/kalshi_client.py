@@ -147,6 +147,9 @@ class KalshiClient:
     def _post(self, path: str, body: dict) -> Any:
         return self._request("POST", path, body=body)
 
+    def _delete(self, path: str) -> Any:
+        return self._request("DELETE", path)
+
     # ------------------------------------------------------------------
     # Markets
     # ------------------------------------------------------------------
@@ -253,6 +256,52 @@ class KalshiClient:
         path = f"/portfolio/orders/{order_id}"
         data = self._get(path)
         return Order.from_dict(data.get("order", data))
+
+    def sell_position(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        price_dollars: float,
+    ) -> Order:
+        """
+        Sell (exit) an existing position by placing a limit sell order.
+
+        Args:
+            ticker:        Market ticker
+            side:          "yes" or "no" (must match the held position side)
+            count:         Number of contracts to sell
+            price_dollars: Limit price (at or above current bid for immediate fill)
+        """
+        body: dict[str, Any] = {
+            "ticker": ticker,
+            "side": side,
+            "action": "sell",
+            "type": "limit",
+            "count": count,
+        }
+        price_cents = max(1, min(99, round(price_dollars * 100)))
+        if side == "yes":
+            body["yes_price"] = price_cents
+        else:
+            body["no_price"] = price_cents
+
+        path = "/portfolio/orders"
+        data = self._post(path, body)
+        order = Order.from_dict(data.get("order", data))
+        log.info(
+            "Exit order placed: %s %s sell x%d @ $%.2f → id=%s status=%s",
+            ticker, side, count, price_dollars, order.order_id, order.status,
+        )
+        return order
+
+    def cancel_order(self, order_id: str) -> None:
+        """Cancel an open order. Silently ignores 404 (already filled/cancelled)."""
+        try:
+            self._delete(f"/portfolio/orders/{order_id}")
+            log.info("Order cancelled: %s", order_id)
+        except Exception as e:
+            log.warning("Cancel failed for %s: %s", order_id[:8], e)
 
     def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> list[Order]:
         path = "/portfolio/orders"

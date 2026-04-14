@@ -45,6 +45,8 @@ VOL_SAFETY_MARGIN: float = _float("VOL_SAFETY_MARGIN", 1.25)  # inflate vol esti
 MAX_VOL_RATIO: float = _float("MAX_VOL_RATIO", 1.8)  # skip trading when short/long vol ratio exceeds this (unstable regime)
 MIN_BID_ASK_SPREAD: float = _float("MIN_BID_ASK_SPREAD", 0.0)   # minimum acceptable bid (liquidity filter)
 MAX_BID_ASK_SPREAD: float = _float("MAX_BID_ASK_SPREAD", 0.25)  # skip markets where ask-bid > this (wide spread = phantom edge)
+MAX_BID_ASK_PCT_SPREAD: float = _float("MAX_BID_ASK_PCT_SPREAD", 0.30)  # skip if spread > 30% of mid-price (relative illiquidity filter)
+MAX_LAST_PRICE_DIVERGENCE: float = _float("MAX_LAST_PRICE_DIVERGENCE", 0.15)  # skip if last_price diverges > 0.15 from yes_mid (stale/moving market)
 
 # --- Risk ---
 MAX_DAILY_SPEND: float = _float("MAX_DAILY_SPEND", 5.0)   # was 100 — protect small bankrolls
@@ -53,6 +55,22 @@ MAX_POSITIONS: int = _int("MAX_POSITIONS", 2)              # was 5 — fewer cor
 KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.10)    # was 0.25 — much more conservative
 MAX_DRAWDOWN_PCT: float = _float("MAX_DRAWDOWN_PCT", 0.20)  # stop trading if account drops 20% from session start
 BANKROLL_FRACTION: float = _float("BANKROLL_FRACTION", 0.25)  # never risk more than 25% of actual balance per day
+
+# --- Implied Vol Calibration ---
+IV_CALIBRATION_MIN_OBS: int = _int("IV_CALIBRATION_MIN_OBS", 10)     # min cycles before using adaptive margin
+IV_SAFETY_MARGIN_MIN: float = _float("IV_SAFETY_MARGIN_MIN", 1.05)   # clamp adaptive margin to this floor
+IV_SAFETY_MARGIN_MAX: float = _float("IV_SAFETY_MARGIN_MAX", 3.0)    # clamp adaptive margin to this ceiling
+
+# --- Position Exit ---
+ENABLE_POSITION_EXIT: bool = _bool("ENABLE_POSITION_EXIT", True)
+EXIT_LOSS_TRIGGER: float = _float("EXIT_LOSS_TRIGGER", 0.40)  # exit when theoretical value drops to 40% of entry price
+
+# --- Smart Order Placement ---
+ENABLE_PRICE_IMPROVEMENT: bool = _bool("ENABLE_PRICE_IMPROVEMENT", True)
+PRICE_IMPROVEMENT_TIMEOUT_SEC: int = _int("PRICE_IMPROVEMENT_TIMEOUT_SEC", 45)  # wait this long for mid-price fill
+
+# --- Monitoring ---
+ALERT_WEBHOOK_URL: str = os.getenv("ALERT_WEBHOOK_URL", "")  # Slack/Discord webhook; empty = log only
 
 # --- Execution ---
 POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 120)  # was 300 — react faster to opportunities

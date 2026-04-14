@@ -32,6 +32,7 @@ class Signal:
     fee: float        # taker fee deducted (dollars per contract)
     theo_prob: float
     strike: float
+    mid_price: float = 0.0  # bid-ask midpoint for price-improvement orders
 
 
 def _parse_strike(ticker: str) -> Optional[float]:
@@ -61,6 +62,8 @@ def evaluate(
     min_t_hours: float,
     fee: float = 0.0,
     max_bid_ask_spread: float = 0.25,
+    max_bid_ask_pct_spread: float = 0.30,
+    max_last_price_divergence: float = 0.15,
 ) -> Optional["Signal"]:
     """
     Evaluate one Kalshi market and return a Signal if an edge exists, else None.
@@ -84,12 +87,31 @@ def evaluate(
         log.debug("Skipping %s: T=%.2fh < min %.2fh", market.ticker, T_hours, min_t_hours)
         return None
 
-    # Bid-ask spread filter: wide spreads signal illiquidity and phantom edges
+    # Bid-ask spread filter: two conditions — absolute and percentage-of-mid
     yes_spread = market.yes_ask - market.yes_bid
     no_spread = market.no_ask - market.no_bid
-    if yes_spread > max_bid_ask_spread and no_spread > max_bid_ask_spread:
-        log.debug("Skipping %s: spreads too wide (yes=%.2f, no=%.2f)", market.ticker, yes_spread, no_spread)
+    yes_mid = (market.yes_ask + market.yes_bid) / 2
+    no_mid = (market.no_ask + market.no_bid) / 2
+    yes_pct = yes_spread / yes_mid if yes_mid > 0.01 else 99.0
+    no_pct = no_spread / no_mid if no_mid > 0.01 else 99.0
+    # A side is tradeable only if it passes both absolute and percentage spread tests
+    yes_ok = yes_spread <= max_bid_ask_spread and yes_pct <= max_bid_ask_pct_spread
+    no_ok = no_spread <= max_bid_ask_spread and no_pct <= max_bid_ask_pct_spread
+    if not yes_ok and not no_ok:
+        log.debug(
+            "Skipping %s: spreads too wide (yes=%.3f/%.0f%%, no=%.3f/%.0f%%)",
+            market.ticker, yes_spread, yes_pct * 100, no_spread, no_pct * 100,
+        )
         return None
+
+    # last_price divergence filter: stale or rapidly-moving markets have unreliable edges
+    if market.last_price is not None:
+        if abs(market.last_price - yes_mid) > max_last_price_divergence:
+            log.debug(
+                "Skipping %s: last_price %.2f diverges %.2f from yes_mid %.2f",
+                market.ticker, market.last_price, abs(market.last_price - yes_mid), yes_mid,
+            )
+            return None
 
     T_years = T_hours / 8760.0
     theo_prob = calc_prob(spot_price, strike, T_years, sigma)
@@ -112,12 +134,12 @@ def evaluate(
     best_gross = -999.0
     best_net = min_edge  # net edge must exceed threshold
 
-    # Only consider a side if its spread is acceptable
-    if net_yes > best_net and yes_spread <= max_bid_ask_spread:
+    # Only consider a side if it passes spread filters
+    if net_yes > best_net and yes_ok:
         best_side = "yes"
         best_net = net_yes
         best_gross = gross_yes
-    if net_no > best_net and no_spread <= max_bid_ask_spread:
+    if net_no > best_net and no_ok:
         best_side = "no"
         best_net = net_no
         best_gross = gross_no
@@ -126,6 +148,7 @@ def evaluate(
         return None
 
     ask_price = market.yes_ask if best_side == "yes" else market.no_ask
+    mid = yes_mid if best_side == "yes" else no_mid
 
     return Signal(
         ticker=market.ticker,
@@ -136,6 +159,7 @@ def evaluate(
         fee=fee,
         theo_prob=theo_prob,
         strike=strike,
+        mid_price=mid,
     )
 
 
@@ -148,6 +172,8 @@ def scan_markets(
     held_tickers: set[str],
     fee: float = 0.0,
     max_bid_ask_spread: float = 0.25,
+    max_bid_ask_pct_spread: float = 0.30,
+    max_last_price_divergence: float = 0.15,
 ) -> list[Signal]:
     """
     Evaluate all markets and return signals sorted by net edge (highest first).
@@ -161,6 +187,8 @@ def scan_markets(
         sig = evaluate(
             market, spot_price, sigma, min_edge, min_t_hours,
             fee=fee, max_bid_ask_spread=max_bid_ask_spread,
+            max_bid_ask_pct_spread=max_bid_ask_pct_spread,
+            max_last_price_divergence=max_last_price_divergence,
         )
         if sig:
             signals.append(sig)

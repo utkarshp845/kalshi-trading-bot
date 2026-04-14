@@ -115,9 +115,18 @@ class Store:
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type}")
 
+        new_order_cols_2 = {
+            "settled_value": "REAL",  # 1.0=won, 0.0=lost, NULL=not yet settled
+        }
+        for col, col_type in new_order_cols_2.items():
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type}")
+
         run_cols = {
-            "sigma_short": "REAL",
-            "sigma_long":  "REAL",
+            "sigma_short":           "REAL",
+            "sigma_long":            "REAL",
+            "iv_rv_ratio":           "REAL",  # cycle IV/RV ratio from market prices
+            "adaptive_safety_margin": "REAL", # actual vol margin used this cycle
         }
         existing_runs = {
             row[1]
@@ -166,6 +175,7 @@ class Store:
         fill_price: Optional[float] = None
         slippage: Optional[float] = None
         realized_edge: Optional[float] = None
+        settled_value: Optional[float] = None
 
         if order.fill_count > 0 and order.taker_fill_cost > 0:
             fill_price = order.taker_fill_cost / order.fill_count
@@ -181,15 +191,31 @@ class Store:
                 if theo_prob is not None and fee is not None:
                     realized_edge = theo_prob - fill_price - (fee or 0.0)
 
+        # Detect settlement and record outcome for probability calibration.
+        # At settlement: status is 'settled' or 'expired'.
+        # A winning YES contract: fill_count > 0 after settlement (Kalshi settles by filling).
+        # A losing YES contract: fill_count == 0 at settlement (no payout).
+        if order.status in ("settled", "expired"):
+            if order.action == "buy":
+                if order.side == "yes":
+                    settled_value = 1.0 if order.fill_count > 0 else 0.0
+                else:  # side == "no"
+                    settled_value = 1.0 if order.fill_count > 0 else 0.0
+                log.info(
+                    "Settlement %s: side=%s fill_count=%d → settled_value=%.1f",
+                    order.order_id[:8], order.side, order.fill_count, settled_value,
+                )
+
         self._conn.execute("""
             UPDATE orders
-               SET status           = ?,
-                   fill_count       = ?,
-                   cost_dollars     = ?,
+               SET status             = ?,
+                   fill_count         = ?,
+                   cost_dollars       = ?,
                    fill_price_dollars = ?,
-                   slippage         = ?,
-                   realized_edge    = ?,
-                   fill_checked_at  = ?
+                   slippage           = ?,
+                   realized_edge      = ?,
+                   settled_value      = COALESCE(?, settled_value),
+                   fill_checked_at    = ?
              WHERE order_id = ?
         """, (
             order.status,
@@ -198,6 +224,7 @@ class Store:
             fill_price,
             slippage,
             realized_edge,
+            settled_value,
             _now_iso(),
             order.order_id,
         ))
@@ -229,15 +256,19 @@ class Store:
         signals_found: int,
         orders_placed: int,
         dry_run: bool,
+        iv_rv_ratio: Optional[float] = None,
+        adaptive_safety_margin: Optional[float] = None,
     ) -> None:
         self._conn.execute("""
             INSERT INTO runs
               (run_at, btc_price, sigma_short, sigma_long,
-               markets_scanned, signals_found, orders_placed, dry_run)
-            VALUES (?,?,?,?,?,?,?,?)
+               markets_scanned, signals_found, orders_placed, dry_run,
+               iv_rv_ratio, adaptive_safety_margin)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
         """, (
             _now_iso(), btc_price, sigma_short, sigma_long,
             markets_scanned, signals_found, orders_placed, int(dry_run),
+            iv_rv_ratio, adaptive_safety_margin,
         ))
         self._conn.commit()
 
@@ -254,6 +285,43 @@ class Store:
                AND logged_at >= ?
         """, (cutoff,)).fetchall()
         return [r[0] for r in rows]
+
+    def get_recent_iv_rv_ratios(self, n: int = 20) -> list[float]:
+        """Return the last n iv_rv_ratio values from the runs table (non-NULL only)."""
+        rows = self._conn.execute("""
+            SELECT iv_rv_ratio FROM runs
+             WHERE iv_rv_ratio IS NOT NULL
+             ORDER BY run_at DESC
+             LIMIT ?
+        """, (n,)).fetchall()
+        return [float(r[0]) for r in rows]
+
+    def get_prob_calibration_bias(
+        self,
+        min_trades: int = 10,
+        lookback_days: int = 30,
+    ) -> Optional[float]:
+        """
+        Return the average (settled_value - theo_prob) for settled trades in the
+        last lookback_days. Returns None if fewer than min_trades are available.
+
+        Positive bias → model under-predicts probability (increase safety margin).
+        Negative bias → model over-predicts probability (decrease safety margin).
+        """
+        cutoff = datetime.now(timezone.utc).isoformat()[:10]  # YYYY-MM-DD format
+        from datetime import timedelta as _td
+        lookback_date = (datetime.now(timezone.utc) - _td(days=lookback_days)).isoformat()[:10]
+        row = self._conn.execute("""
+            SELECT AVG(settled_value - theo_prob), COUNT(*)
+              FROM orders
+             WHERE settled_value IS NOT NULL
+               AND theo_prob IS NOT NULL
+               AND logged_at >= ?
+               AND action = 'buy'
+        """, (lookback_date,)).fetchone()
+        if row is None or row[1] is None or row[1] < min_trades:
+            return None
+        return float(row[0])
 
     def get_todays_spend(self) -> float:
         today = _now_iso()[:10]
