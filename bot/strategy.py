@@ -32,7 +32,8 @@ class Signal:
     fee: float        # taker fee deducted (dollars per contract)
     theo_prob: float
     strike: float
-    mid_price: float = 0.0  # bid-ask midpoint for price-improvement orders
+    mid_price: float = 0.0      # bid-ask midpoint for price-improvement orders
+    hours_to_expiry: float = 0.0
 
 
 def _parse_strike(ticker: str) -> Optional[float]:
@@ -64,7 +65,7 @@ def evaluate(
     max_bid_ask_spread: float = 0.25,
     max_bid_ask_pct_spread: float = 0.30,
     max_last_price_divergence: float = 0.15,
-) -> Optional["Signal"]:
+) -> tuple[Optional["Signal"], str]:
     """
     Evaluate one Kalshi market and return a Signal if an edge exists, else None.
 
@@ -80,12 +81,12 @@ def evaluate(
     strike = _parse_strike(market.ticker)
     if strike is None:
         log.debug("Skipping %s: cannot parse strike", market.ticker)
-        return None
+        return None, "strike_parse"
 
     T_hours = _hours_to_expiry(market.close_time)
     if T_hours < min_t_hours:
         log.debug("Skipping %s: T=%.2fh < min %.2fh", market.ticker, T_hours, min_t_hours)
-        return None
+        return None, "t_too_small"
 
     # Bid-ask spread filter: two conditions — absolute and percentage-of-mid
     yes_spread = market.yes_ask - market.yes_bid
@@ -102,7 +103,7 @@ def evaluate(
             "Skipping %s: spreads too wide (yes=%.3f/%.0f%%, no=%.3f/%.0f%%)",
             market.ticker, yes_spread, yes_pct * 100, no_spread, no_pct * 100,
         )
-        return None
+        return None, "spread_too_wide"
 
     # last_price divergence filter: stale or rapidly-moving markets have unreliable edges
     if market.last_price is not None:
@@ -111,7 +112,7 @@ def evaluate(
                 "Skipping %s: last_price %.2f diverges %.2f from yes_mid %.2f",
                 market.ticker, market.last_price, abs(market.last_price - yes_mid), yes_mid,
             )
-            return None
+            return None, "last_price_diverge"
 
     T_years = T_hours / 8760.0
     theo_prob = calc_prob(spot_price, strike, T_years, sigma)
@@ -145,7 +146,7 @@ def evaluate(
         best_gross = gross_no
 
     if best_side is None:
-        return None
+        return None, "insufficient_edge"
 
     ask_price = market.yes_ask if best_side == "yes" else market.no_ask
     mid = yes_mid if best_side == "yes" else no_mid
@@ -160,7 +161,8 @@ def evaluate(
         theo_prob=theo_prob,
         strike=strike,
         mid_price=mid,
-    )
+        hours_to_expiry=T_hours,
+    ), ""
 
 
 def scan_markets(
@@ -179,12 +181,15 @@ def scan_markets(
     Evaluate all markets and return signals sorted by net edge (highest first).
     Markets already held are skipped.
     """
-    signals = []
+    signals: list[Signal] = []
+    rejection_counts: dict[str, int] = {}
+
     for market in markets:
         if market.ticker in held_tickers:
+            rejection_counts["already_held"] = rejection_counts.get("already_held", 0) + 1
             log.debug("Skipping %s: already held", market.ticker)
             continue
-        sig = evaluate(
+        sig, reason = evaluate(
             market, spot_price, sigma, min_edge, min_t_hours,
             fee=fee, max_bid_ask_spread=max_bid_ask_spread,
             max_bid_ask_pct_spread=max_bid_ask_pct_spread,
@@ -192,7 +197,22 @@ def scan_markets(
         )
         if sig:
             signals.append(sig)
+        else:
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
     signals.sort(key=lambda s: s.edge, reverse=True)
-    log.info("Found %d signal(s) out of %d markets", len(signals), len(markets))
+
+    rejected_total = sum(rejection_counts.values())
+    if rejected_total:
+        breakdown = ", ".join(
+            f"{r}={c}"
+            for r, c in sorted(rejection_counts.items(), key=lambda x: -x[1])
+        )
+        log.info(
+            "Found %d signal(s) out of %d markets — %d rejected: %s",
+            len(signals), len(markets), rejected_total, breakdown,
+        )
+    else:
+        log.info("Found %d signal(s) out of %d markets", len(signals), len(markets))
+
     return signals

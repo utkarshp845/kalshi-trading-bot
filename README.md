@@ -1,30 +1,31 @@
 # Kalshi BTC Arbitrage Bot
 
-A mispricing arbitrage bot for [Kalshi](https://kalshi.com) BTC daily price-level markets. It prices binary contracts with a log-normal model, measures the gap between realized and implied volatility directly from market prices, and trades when the edge is large enough to survive model uncertainty.
+A mispricing arbitrage bot for [Kalshi](https://kalshi.com) BTC daily price-level markets. It prices binary contracts with a log-normal model, measures the gap between realized and implied volatility directly from live market prices, and trades when the edge is large enough to survive model uncertainty.
 
 ## How it works
 
 Kalshi's `KXBTC` series are binary contracts that pay $1 if BTC closes above a given strike price at 4 PM ET. Each cycle the bot:
 
 1. **Fetches** BTC spot price + 7-day and 30-day realized volatility from Kraken
-2. **Backs out implied vol** from near-ATM Kalshi market prices — replacing the static safety margin with a market-measured IV/RV ratio that adapts to event risk automatically
+2. **Backs out implied vol** from near-ATM Kalshi market prices — computing a data-driven IV/RV ratio that replaces the static safety margin and adapts to event risk automatically
 3. **Prices** each contract with the IV-adjusted volatility:
    ```
    P(BTC > K) = Φ( ln(S/K) / (σ_adjusted × √T) )
    ```
-4. **Filters** markets: time to expiry ≥ 1 hour, bid-ask spread ≤ 25% of mid-price, `last_price` within $0.15 of mid, vol regime stable (σ_7d/σ_30d ≤ 1.8)
+4. **Filters** markets: time to expiry ≥ 1 hour, bid-ask spread ≤ 25% / 30% of mid, `last_price` within $0.15 of mid, vol regime stable (σ_7d/σ_30d ≤ 1.8)
 5. **Trades** the best opportunity when `net_edge > MIN_EDGE`, sized by fractional Kelly with balance-awareness and a correlation discount
-6. **Manages positions**: checks open positions each cycle and exits via limit sell if theoretical value drops to ≤40% of entry price
-7. **Tries to improve fills**: attempts mid-price first, falls back to ask after 45 seconds
-8. **Self-calibrates**: after 30+ settled trades, adjusts `VOL_SAFETY_MARGIN` based on measured probability bias
-9. **Repeats** every 120 seconds during market hours (9 AM – 3:30 PM ET)
+6. **Manages positions**: exits via limit sell if theoretical value drops to ≤ 40% of entry price
+7. **Improves fills**: attempts mid-price first, falls back to ask after 45 seconds; both partial fills tracked for accurate P&L
+8. **Self-calibrates**: after 10+ cycles, replaces the static vol margin with the rolling median IV/RV ratio from live market prices
+9. **Reports**: writes a daily markdown report after every cycle covering P&L, fill quality, and market context
+10. **Repeats** every 120 seconds during market hours (9 AM – 3:30 PM ET)
 
 ## Project structure
 
 ```
 bot/
   main.py          # Entry point, main loop, cycle orchestration
-  strategy.py      # Signal generation: parse strike, edge calc, market filters
+  strategy.py      # Signal generation: strike parsing, edge calc, market filters
   pricing.py       # Log-normal binary option pricer
   implied_vol.py   # IV back-out from market prices, adaptive safety margin
   kalshi_client.py # Kalshi REST API v2 client (RSA-PSS auth, buy/sell/cancel)
@@ -33,6 +34,7 @@ bot/
   store.py         # SQLite persistence, fill quality, calibration queries
   config.py        # All config loaded from environment variables
   monitor.py       # Slack/Discord webhook alerting
+  report.py        # Daily markdown report generator
 
 tests/
   test_pricing.py      # Log-normal model: ATM, expiry, monotonicity, edge cases
@@ -40,9 +42,14 @@ tests/
   test_risk.py         # Kelly sizing, drawdown halt, correlation discount
   test_store.py        # SQLite persistence, calibration bias query
   test_implied_vol.py  # IV back-out round-trip, edge cases
+  test_execution.py    # Price improvement: partial fills, blended cost accounting
+  test_report.py       # Daily report: P&L, settlements, market context, date isolation
 
 docs/
   strategy.md      # Full strategy reference with formulas and parameter guide
+
+reports/
+  YYYY-MM-DD.md    # Auto-generated daily reports (gitignored)
 ```
 
 ## Setup
@@ -68,7 +75,7 @@ python -m bot.main --dry-run   # test signals without placing orders
 pytest tests/ -v
 ```
 
-All 70 tests run without network access.
+All 82 tests run without network access.
 
 ### EC2 (production)
 
@@ -100,7 +107,7 @@ Copy `.env.example` to `.env` and set the values.
 | `MAX_VOL_RATIO` | `1.8` | Skip cycle when σ_7d/σ_30d exceeds this (unstable regime) |
 | `MAX_BID_ASK_SPREAD` | `0.25` | Maximum absolute bid-ask spread |
 | `MAX_BID_ASK_PCT_SPREAD` | `0.30` | Maximum spread as % of mid-price |
-| `MAX_LAST_PRICE_DIVERGENCE` | `0.15` | Skip if last_price diverges >$0.15 from mid |
+| `MAX_LAST_PRICE_DIVERGENCE` | `0.15` | Skip if last_price diverges > $0.15 from mid |
 
 ### Risk
 | Variable | Default | Description |
@@ -109,7 +116,7 @@ Copy `.env.example` to `.env` and set the values.
 | `MAX_POSITIONS` | `2` | Max concurrent open positions |
 | `KELLY_FRACTION` | `0.10` | Fraction of full Kelly to bet |
 | `MAX_DRAWDOWN_PCT` | `0.20` | Stop trading if account drops 20% from session start |
-| `BANKROLL_FRACTION` | `0.25` | Never risk >25% of actual balance per day |
+| `BANKROLL_FRACTION` | `0.25` | Never risk > 25% of actual balance per day |
 
 ### Implied Vol Calibration
 | Variable | Default | Description |
@@ -152,12 +159,25 @@ tail -f ~/money-money/logs/bot.log
 # Service status
 sudo systemctl status kalshi-bot
 
-# Today's trades
+# Today's report
+cat ~/money-money/reports/$(date -u +%Y-%m-%d).md
+
+# Generate/regenerate report for a specific date
+python -m bot.report --date 2026-04-15
+
+# Today's trades (raw CSV)
 cat ~/money-money/logs/trades.csv
 
-# Calibration check (requires sqlite3)
+# IV/RV regime (last 10 cycles)
 sqlite3 data/bot.db "SELECT run_at, iv_rv_ratio, adaptive_safety_margin FROM runs ORDER BY run_at DESC LIMIT 10;"
 
-# Realized vs predicted edge (after 30+ trades)
-sqlite3 data/bot.db "SELECT AVG(settled_value - theo_prob) AS prob_bias, COUNT(*) AS trades FROM orders WHERE settled_value IS NOT NULL;"
+# Calibration check (after 30+ settled trades)
+sqlite3 data/bot.db "SELECT AVG(settled_value - theo_prob) AS prob_bias, COUNT(*) AS n FROM orders WHERE settled_value IS NOT NULL;"
+
+# Fill quality
+sqlite3 data/bot.db "SELECT AVG(gross_edge), AVG(realized_edge), AVG(slippage), COUNT(*) FROM orders WHERE fill_count > 0;"
 ```
+
+## Strategy deep-dive
+
+See [docs/strategy.md](docs/strategy.md) for a full reference covering the probability model, IV calibration, Kelly sizing derivation, execution logic, fill quality metrics, and known limitations.
