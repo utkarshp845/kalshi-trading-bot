@@ -69,6 +69,7 @@ class Store:
                 realized_edge       REAL,
                 fill_checked_at     TEXT,
                 created_time        TEXT,
+                hours_to_expiry     REAL,
                 logged_at           TEXT NOT NULL
             );
 
@@ -116,7 +117,8 @@ class Store:
                 self._conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type}")
 
         new_order_cols_2 = {
-            "settled_value": "REAL",  # 1.0=won, 0.0=lost, NULL=not yet settled
+            "settled_value":    "REAL",  # 1.0=won, 0.0=lost, NULL=not yet settled
+            "hours_to_expiry":  "REAL",
         }
         for col, col_type in new_order_cols_2.items():
             if col not in existing:
@@ -140,14 +142,22 @@ class Store:
     # Write methods
     # ------------------------------------------------------------------
 
-    def log_order(self, order: Order, theo_prob: float, gross_edge: float, edge: float, fee: float) -> None:
+    def log_order(
+        self,
+        order: Order,
+        theo_prob: float,
+        gross_edge: float,
+        edge: float,
+        fee: float,
+        hours_to_expiry: Optional[float] = None,
+    ) -> None:
         now = _now_iso()
         self._conn.execute("""
             INSERT OR REPLACE INTO orders
               (order_id, client_order_id, ticker, side, action, status,
                yes_price, no_price, count, fill_count, cost_dollars,
-               theo_prob, gross_edge, edge, fee, created_time, logged_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               theo_prob, gross_edge, edge, fee, hours_to_expiry, created_time, logged_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             order.order_id,
             order.client_order_id,
@@ -164,11 +174,12 @@ class Store:
             gross_edge,
             edge,
             fee,
+            hours_to_expiry,
             order.created_time,
             now,
         ))
         self._conn.commit()
-        self._append_trades_csv(order, theo_prob, gross_edge, edge, fee, now)
+        self._append_trades_csv(order, theo_prob, gross_edge, edge, fee, hours_to_expiry, now)
 
     def update_order_fill(self, order: Order) -> None:
         """Update fill status and compute fill quality metrics for a previously logged order."""
@@ -337,7 +348,7 @@ class Store:
 
     def _append_trades_csv(
         self, order: Order, theo_prob: float, gross_edge: float,
-        edge: float, fee: float, logged_at: str,
+        edge: float, fee: float, hours_to_expiry: Optional[float], logged_at: str,
     ) -> None:
         write_header = not self._trades_csv.exists() or self._trades_csv.stat().st_size == 0
         with open(self._trades_csv, "a", newline="") as f:
@@ -346,10 +357,10 @@ class Store:
                 writer.writerow([
                     "logged_at", "order_id", "ticker", "side", "action", "status",
                     "count", "fill_count", "cost_dollars",
-                    "theo_prob", "gross_edge", "edge", "fee",
+                    "theo_prob", "gross_edge", "edge", "fee", "hours_to_expiry",
                 ])
             writer.writerow([
                 logged_at, order.order_id, order.ticker, order.side, order.action, order.status,
                 order.count, order.fill_count, order.taker_fill_cost,
-                theo_prob, gross_edge, edge, fee,
+                theo_prob, gross_edge, edge, fee, hours_to_expiry,
             ])

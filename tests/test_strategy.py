@@ -67,16 +67,19 @@ class TestEvaluate:
 
     def test_returns_signal_when_edge_exists(self):
         market = self._market_with_edge()
-        sig = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
+        sig, reason = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
         assert sig is not None
+        assert reason == ""
         assert sig.side in ("yes", "no")
         assert sig.edge > MIN_EDGE
         assert sig.ticker == market.ticker
+        assert sig.hours_to_expiry > 0
 
     def test_returns_none_when_t_too_small(self):
         market = self._market_with_edge(hours=0.5)
-        sig = evaluate(market, SPOT, SIGMA, MIN_EDGE, min_t_hours=1.0, fee=FEE)
+        sig, reason = evaluate(market, SPOT, SIGMA, MIN_EDGE, min_t_hours=1.0, fee=FEE)
         assert sig is None
+        assert reason == "t_too_small"
 
     def test_returns_none_when_absolute_spread_too_wide(self):
         close = _future_close(4.0)
@@ -86,8 +89,9 @@ class TestEvaluate:
             no_ask=0.40, no_bid=0.10,
             close_time=close,
         )
-        sig = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE, max_bid_ask_spread=0.25)
+        sig, reason = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE, max_bid_ask_spread=0.25)
         assert sig is None
+        assert reason == "spread_too_wide"
 
     def test_returns_none_when_pct_spread_too_wide(self):
         close = _future_close(4.0)
@@ -98,7 +102,7 @@ class TestEvaluate:
             no_ask=0.80, no_bid=0.70,
             close_time=close,
         )
-        sig = evaluate(
+        sig, reason = evaluate(
             market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE,
             max_bid_ask_spread=0.25, max_bid_ask_pct_spread=0.30,
         )
@@ -118,8 +122,9 @@ class TestEvaluate:
             close_time=close,
             last_price=0.70,
         )
-        sig = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE, max_last_price_divergence=0.15)
+        sig, reason = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE, max_last_price_divergence=0.15)
         assert sig is None
+        assert reason == "last_price_diverge"
 
     def test_accepts_market_when_last_price_within_tolerance(self):
         close = _future_close(4.0)
@@ -131,13 +136,14 @@ class TestEvaluate:
             close_time=close,
             last_price=0.63,   # close to yes_mid=0.635
         )
-        sig = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE, max_last_price_divergence=0.15)
+        sig, _ = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE, max_last_price_divergence=0.15)
         assert sig is not None
 
     def test_returns_none_when_strike_unparseable(self):
         market = make_market(ticker="KXBTC-26APR4PM-INVALID")
-        sig = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
+        sig, reason = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
         assert sig is None
+        assert reason == "strike_parse"
 
     def test_selects_correct_side(self):
         close = _future_close(4.0)
@@ -148,13 +154,13 @@ class TestEvaluate:
             no_ask=0.35, no_bid=0.32,
             close_time=close,
         )
-        sig = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
+        sig, _ = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
         assert sig is not None
         assert sig.side == "yes"  # deep ITM → YES edge
 
     def test_mid_price_in_signal(self):
         market = self._market_with_edge()
-        sig = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
+        sig, _ = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
         if sig is not None:
             expected_mid = (market.yes_ask + market.yes_bid) / 2 if sig.side == "yes" else (market.no_ask + market.no_bid) / 2
             assert abs(sig.mid_price - expected_mid) < 1e-9

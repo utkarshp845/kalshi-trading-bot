@@ -252,6 +252,7 @@ def _check_exits(
                         gross_edge=current_value - sell_price,
                         edge=current_value - sell_price - cfg.KALSHI_TAKER_FEE,
                         fee=cfg.KALSHI_TAKER_FEE,
+                        hours_to_expiry=T_hours,
                     )
                     exited_tickers.append(pos.ticker)
                     alert(
@@ -502,6 +503,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                     gross_edge=sig.gross_edge,
                     edge=sig.edge,
                     fee=sig.fee,
+                    hours_to_expiry=sig.hours_to_expiry,
                 )
             if total_filled > 0:
                 open_count += 1
