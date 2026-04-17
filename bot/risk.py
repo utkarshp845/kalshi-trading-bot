@@ -8,10 +8,14 @@ Sizing model: fractional Kelly for binary contracts with balance awareness
 
 Balance-aware: effective_budget = min(remaining_daily_cap, bankroll_fraction * actual_balance)
 Correlation discount: each additional open position reduces sizing by 30%
-Drawdown guard: stops trading if account drops below (1 - MAX_DRAWDOWN_PCT) * session_start_balance
+Slippage factor: scales spend by empirical realized/predicted edge ratio (≤ 1.0)
+Drawdown guard:
+  * Graduated scaling — position size is scaled down at drawdown tiers (e.g. 10%, 15%)
+  * Hard halt — stops trading entirely when drawdown reaches MAX_DRAWDOWN_PCT
 """
 import logging
 import math
+from typing import Optional
 
 from bot.strategy import Signal
 
@@ -32,6 +36,10 @@ class DailyRisk:
         kelly_fraction: float,
         max_drawdown_pct: float = 0.20,
         bankroll_fraction: float = 0.25,
+        drawdown_tier_1_pct: float = 0.10,
+        drawdown_tier_1_scale: float = 0.50,
+        drawdown_tier_2_pct: float = 0.15,
+        drawdown_tier_2_scale: float = 0.25,
     ):
         self.max_daily_spend = max_daily_spend
         self.max_contracts_per_market = max_contracts_per_market
@@ -39,11 +47,17 @@ class DailyRisk:
         self.kelly_fraction = kelly_fraction
         self.max_drawdown_pct = max_drawdown_pct
         self.bankroll_fraction = bankroll_fraction
+        self.drawdown_tier_1_pct = drawdown_tier_1_pct
+        self.drawdown_tier_1_scale = drawdown_tier_1_scale
+        self.drawdown_tier_2_pct = drawdown_tier_2_pct
+        self.drawdown_tier_2_scale = drawdown_tier_2_scale
 
         self._daily_spent: float = 0.0
         self._positions_opened: int = 0
         self._session_start_balance: float = 0.0
         self._drawdown_halt: bool = False
+        self._drawdown_scale: float = 1.0
+        self._slippage_factor: float = 1.0
 
     # ------------------------------------------------------------------
     # State management
@@ -61,6 +75,23 @@ class DailyRisk:
         self._daily_spent = 0.0
         self._positions_opened = 0
         self._drawdown_halt = False
+        self._drawdown_scale = 1.0
+
+    def set_slippage_factor(self, factor: Optional[float]) -> None:
+        """
+        Set empirical Kelly slippage multiplier. None resets to 1.0 (no adjustment).
+        Clamped to [0.3, 1.0] — we never boost sizing above Kelly, and we floor
+        the factor so a small bad patch doesn't silence the bot entirely.
+        """
+        if factor is None:
+            if self._slippage_factor != 1.0:
+                log.info("Slippage factor cleared (was %.2f)", self._slippage_factor)
+            self._slippage_factor = 1.0
+            return
+        clamped = max(0.3, min(1.0, float(factor)))
+        if abs(clamped - self._slippage_factor) > 1e-6:
+            log.info("Slippage factor: %.2f → %.2f", self._slippage_factor, clamped)
+        self._slippage_factor = clamped
 
     def record_fill(self, cost: float) -> None:
         """Record a completed order fill."""
@@ -81,22 +112,53 @@ class DailyRisk:
     def drawdown_halted(self) -> bool:
         return self._drawdown_halt
 
+    @property
+    def drawdown_scale(self) -> float:
+        return self._drawdown_scale
+
+    @property
+    def slippage_factor(self) -> float:
+        return self._slippage_factor
+
     # ------------------------------------------------------------------
     # Gate and size
     # ------------------------------------------------------------------
 
     def check_drawdown(self, current_balance: float) -> bool:
-        """Return True if drawdown limit is breached. Halts trading for the day."""
+        """
+        Update drawdown state from the current balance.
+
+        Returns True only when the hard halt limit is breached. Below the halt
+        threshold, updates _drawdown_scale to apply graduated sizing cuts at
+        tier_1 and tier_2 drawdown levels (applied inside size_order).
+        """
         if self._session_start_balance <= 0:
             return False
         drawdown = 1.0 - (current_balance / self._session_start_balance)
         if drawdown >= self.max_drawdown_pct:
-            log.warning(
-                "DRAWDOWN HALT: balance $%.2f is %.1f%% below session start $%.2f (limit %.0f%%)",
-                current_balance, drawdown * 100, self._session_start_balance, self.max_drawdown_pct * 100,
-            )
+            if not self._drawdown_halt:
+                log.warning(
+                    "DRAWDOWN HALT: balance $%.2f is %.1f%% below session start $%.2f (limit %.0f%%)",
+                    current_balance, drawdown * 100, self._session_start_balance, self.max_drawdown_pct * 100,
+                )
             self._drawdown_halt = True
+            self._drawdown_scale = 0.0
             return True
+
+        # Graduated tiers (highest drawdown tier takes precedence)
+        if drawdown >= self.drawdown_tier_2_pct:
+            new_scale = self.drawdown_tier_2_scale
+        elif drawdown >= self.drawdown_tier_1_pct:
+            new_scale = self.drawdown_tier_1_scale
+        else:
+            new_scale = 1.0
+
+        if abs(new_scale - self._drawdown_scale) > 1e-6:
+            log.info(
+                "Drawdown scale %.2f → %.2f (drawdown=%.1f%%, session start $%.2f)",
+                self._drawdown_scale, new_scale, drawdown * 100, self._session_start_balance,
+            )
+            self._drawdown_scale = new_scale
         return False
 
     def can_trade(self, open_positions: int) -> bool:
@@ -144,6 +206,13 @@ class DailyRisk:
         kelly_f = signal.edge / (1.0 - ask)
         spend = kelly_f * self.kelly_fraction * remaining_budget
 
+        # Empirical slippage adjustment: if past fills delivered less edge than
+        # predicted, scale Kelly down proportionally so we don't bet the phantom portion.
+        spend *= self._slippage_factor
+
+        # Graduated drawdown scaling: shrink sizing at tier thresholds before the hard halt.
+        spend *= self._drawdown_scale
+
         # Correlation discount: each existing position reduces sizing by 30%
         # (all KXBTC positions bet on the same underlying)
         if open_positions > 0:
@@ -159,7 +228,10 @@ class DailyRisk:
         contracts = max(contracts, 0)
 
         log.debug(
-            "Sizing %s %s: edge=%.4f ask=%.2f kelly_f=%.4f spend=%.2f balance=$%.2f → %d contracts",
-            signal.ticker, signal.side, signal.edge, ask, kelly_f, spend, current_balance, contracts,
+            "Sizing %s %s: edge=%.4f ask=%.2f kelly_f=%.4f slip=%.2f dd=%.2f "
+            "spend=%.2f balance=$%.2f → %d contracts",
+            signal.ticker, signal.side, signal.edge, ask, kelly_f,
+            self._slippage_factor, self._drawdown_scale,
+            spend, current_balance, contracts,
         )
         return contracts

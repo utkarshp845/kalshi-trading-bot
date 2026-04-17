@@ -49,10 +49,13 @@ class FakeKalshi:
 
 @pytest.fixture(autouse=True)
 def _fast_price_improvement(monkeypatch):
-    """Don't actually sleep during tests."""
+    """Don't actually sleep or hit the network during tests."""
     monkeypatch.setattr(main_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(main_mod, "get_spot_price", lambda: 95000.0)
     monkeypatch.setattr(cfg, "ENABLE_PRICE_IMPROVEMENT", True)
     monkeypatch.setattr(cfg, "PRICE_IMPROVEMENT_TIMEOUT_SEC", 0)
+    monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 10)
+    monkeypatch.setattr(cfg, "STALE_ORDER_SPOT_MOVE_PCT", 0.003)
 
 
 class TestExecuteWithPriceImprovement:
@@ -126,6 +129,57 @@ class TestExecuteWithPriceImprovement:
         assert len(orders) == 1
         assert kalshi.place_calls == [("KXBTC-26APR4PM-B95000", "yes", 10, 0.45)]
         assert kalshi.cancels == []
+
+    def test_spot_drift_cancels_and_skips_ask_fallback(self, monkeypatch):
+        """If BTC spot drifts past the threshold during the mid wait, cancel and abort."""
+        monkeypatch.setattr(cfg, "PRICE_IMPROVEMENT_TIMEOUT_SEC", 30)
+        monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 10)
+        monkeypatch.setattr(cfg, "STALE_ORDER_SPOT_MOVE_PCT", 0.003)
+        # Entry spot 95000; first poll sees 95500 (~0.53% drift) → cancel
+        spot_sequence = iter([95000.0, 95500.0])
+        monkeypatch.setattr(main_mod, "get_spot_price", lambda: next(spot_sequence))
+
+        mid_partial = _order("o1", count=10, fill_count=0, fill_cost=0.0, price=0.42)
+        kalshi = FakeKalshi(
+            place_results=[mid_partial],
+            get_results={"o1": mid_partial},
+        )
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+        )
+
+        # Mid order cancelled, no ask fallback placed → no fills returned
+        assert orders == []
+        assert kalshi.cancels == ["o1"]
+        # Only one place_order call (the mid); no ask fallback
+        assert len(kalshi.place_calls) == 1
+
+    def test_spot_within_tolerance_continues_to_ask_fallback(self, monkeypatch):
+        """If BTC drift stays within threshold, normal ask fallback proceeds on remainder."""
+        monkeypatch.setattr(cfg, "PRICE_IMPROVEMENT_TIMEOUT_SEC", 10)
+        monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 10)
+        monkeypatch.setattr(cfg, "STALE_ORDER_SPOT_MOVE_PCT", 0.01)  # 1% tolerance
+        # Entry 95000, poll sees 95100 (~0.1% drift, under threshold)
+        spot_sequence = iter([95000.0, 95100.0])
+        monkeypatch.setattr(main_mod, "get_spot_price", lambda: next(spot_sequence))
+
+        mid_partial = _order("o1", count=10, fill_count=3, fill_cost=1.26, price=0.42)
+        ask_fill = _order("o2", count=7, fill_count=7, fill_cost=3.15, price=0.45)
+        kalshi = FakeKalshi(
+            place_results=[mid_partial, ask_fill],
+            get_results={"o1": mid_partial},
+        )
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+        )
+
+        assert len(orders) == 2
+        assert kalshi.cancels == ["o1"]
+        assert kalshi.place_calls[1] == ("KXBTC-26APR4PM-B95000", "yes", 7, 0.45)
 
     def test_mid_at_or_above_ask_skips_improvement(self):
         ask_fill = _order("o1", count=10, fill_count=10, fill_cost=4.50, price=0.45)
