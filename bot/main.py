@@ -16,7 +16,7 @@ from typing import Optional
 
 import bot.config as cfg
 from bot.implied_vol import fit_cycle_iv
-from bot.kalshi_client import KalshiClient, Position
+from bot.kalshi_client import KalshiClient, Order, Position
 from bot.monitor import alert
 from bot.price_feed import get_btc_price_and_vol
 from bot.pricing import calc_prob
@@ -274,18 +274,20 @@ def _execute_with_price_improvement(
     ask_price: float,
     mid_price: float,
     dry_run: bool,
-) -> Optional[object]:
+) -> list[Order]:
     """
     Attempt to fill at the mid-price first (price improvement).
     After PRICE_IMPROVEMENT_TIMEOUT_SEC, cancel any unfilled portion
     and re-fill at the ask price.
 
-    Returns the final Order object (may be from two partial orders combined),
-    or None if no fill occurred.
+    Returns the list of Orders that resulted in fills (may be 0, 1, or 2).
+    Callers must sum taker_fill_cost across returned orders for accurate
+    balance and risk accounting.
     """
     if not cfg.ENABLE_PRICE_IMPROVEMENT or mid_price >= ask_price:
         # No improvement possible — just fill at ask
-        return kalshi.place_order(ticker, side, contracts, ask_price)
+        order = kalshi.place_order(ticker, side, contracts, ask_price)
+        return [order] if order is not None else []
 
     # Phase 1: try mid-price
     try:
@@ -293,7 +295,8 @@ def _execute_with_price_improvement(
         log.info("Price improvement: placed %d @ mid=%.3f (ask=%.3f)", contracts, mid_price, ask_price)
     except Exception as e:
         log.warning("Mid-price order failed, falling back to ask: %s", e)
-        return kalshi.place_order(ticker, side, contracts, ask_price)
+        order = kalshi.place_order(ticker, side, contracts, ask_price)
+        return [order] if order is not None else []
 
     time.sleep(cfg.PRICE_IMPROVEMENT_TIMEOUT_SEC)
 
@@ -306,26 +309,30 @@ def _execute_with_price_improvement(
     filled = order1.fill_count
     if filled >= contracts:
         log.info("Price improvement: fully filled %d/%d @ mid", filled, contracts)
-        return order1
+        return [order1]
 
     # Phase 2: cancel remainder and fill at ask
-    if filled < contracts:
-        kalshi.cancel_order(order1.order_id)
-        remaining = contracts - filled
-        if remaining > 0:
-            try:
-                order2 = kalshi.place_order(ticker, side, remaining, ask_price)
-                log.info(
-                    "Price improvement: partial %d filled @ mid, %d filled @ ask",
-                    filled, remaining,
-                )
-                # Return the fallback order (caller records it for the full fill tracking)
-                return order2
-            except Exception as e:
-                log.error("Fallback ask order failed for %s: %s", ticker, e)
-                return order1 if filled > 0 else None
+    kalshi.cancel_order(order1.order_id)
+    remaining = contracts - filled
+    if remaining <= 0:
+        return [order1] if filled > 0 else []
 
-    return order1
+    try:
+        order2 = kalshi.place_order(ticker, side, remaining, ask_price)
+        log.info(
+            "Price improvement: partial %d filled @ mid, %d filled @ ask",
+            filled, remaining,
+        )
+        # Return both orders so caller can account for the full blended cost.
+        results = []
+        if filled > 0:
+            results.append(order1)
+        if order2 is not None:
+            results.append(order2)
+        return results
+    except Exception as e:
+        log.error("Fallback ask order failed for %s: %s", ticker, e)
+        return [order1] if filled > 0 else []
 
 
 def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: bool) -> None:
@@ -468,7 +475,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
 
         try:
             # --- Phase C7: Smart order placement (mid-price with ask fallback) ---
-            order = _execute_with_price_improvement(
+            orders = _execute_with_price_improvement(
                 kalshi=kalshi,
                 ticker=sig.ticker,
                 side=sig.side,
@@ -477,22 +484,27 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 mid_price=sig.mid_price,
                 dry_run=dry_run,
             )
-            if order is None:
+            if not orders:
                 log.warning("Order execution returned no fill for %s", sig.ticker)
                 continue
 
-            fill_cost = order.taker_fill_cost or cost_estimate
+            total_filled = sum(o.fill_count for o in orders)
+            total_cost = sum(o.taker_fill_cost for o in orders)
+            # If the broker hasn't reported fill cost yet, fall back proportionally.
+            fill_cost = total_cost if total_cost > 0 else cost_estimate
             risk.record_fill(fill_cost)
             balance -= fill_cost
-            store.log_order(
-                order,
-                theo_prob=sig.theo_prob,
-                gross_edge=sig.gross_edge,
-                edge=sig.edge,
-                fee=sig.fee,
-            )
-            open_count += 1
-            orders_placed += 1
+            for o in orders:
+                store.log_order(
+                    o,
+                    theo_prob=sig.theo_prob,
+                    gross_edge=sig.gross_edge,
+                    edge=sig.edge,
+                    fee=sig.fee,
+                )
+            if total_filled > 0:
+                open_count += 1
+                orders_placed += 1
             time.sleep(0.5)  # avoid burst rate-limiting between orders
         except Exception as e:
             log.error("Order failed for %s: %s", sig.ticker, e)
