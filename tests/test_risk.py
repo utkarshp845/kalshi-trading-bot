@@ -116,3 +116,97 @@ class TestReset:
         assert risk.daily_spent == 0.0
         assert risk.positions_opened == 0
         assert risk.drawdown_halted is False
+
+
+class TestGraduatedDrawdown:
+    def _sig(self, edge=0.30, price=0.30):
+        return make_signal(edge=edge, price=price)
+
+    def test_no_scale_below_tier_1(self):
+        risk = make_risk()
+        risk.set_session_balance(100.0)
+        risk.check_drawdown(95.0)  # -5%
+        assert risk.drawdown_scale == 1.0
+
+    def test_tier_1_scale_at_10_percent(self):
+        risk = make_risk()
+        risk.set_session_balance(100.0)
+        risk.check_drawdown(89.0)  # -11%
+        assert risk.drawdown_scale == 0.50
+        assert risk.drawdown_halted is False
+
+    def test_tier_2_scale_at_15_percent(self):
+        risk = make_risk()
+        risk.set_session_balance(100.0)
+        risk.check_drawdown(84.0)  # -16%
+        assert risk.drawdown_scale == 0.25
+        assert risk.drawdown_halted is False
+
+    def test_hard_halt_zeros_scale(self):
+        risk = make_risk()
+        risk.set_session_balance(100.0)
+        risk.check_drawdown(79.0)  # -21%
+        assert risk.drawdown_halted is True
+        assert risk.drawdown_scale == 0.0
+
+    def test_drawdown_scale_reduces_size_order(self):
+        # Large budget so Kelly-based sizing dominates
+        risk = make_risk(max_daily_spend=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
+        risk.set_session_balance(1000.0)
+        sig = self._sig(edge=0.30, price=0.30)
+
+        # Baseline
+        baseline = risk.size_order(sig, current_balance=1000.0, open_positions=0)
+
+        # Tier 1 (10%): scale 0.5 → roughly half the contracts
+        risk2 = make_risk(max_daily_spend=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
+        risk2.set_session_balance(1000.0)
+        risk2.check_drawdown(900.0)  # -10%
+        reduced = risk2.size_order(sig, current_balance=900.0, open_positions=0)
+
+        assert baseline > 0
+        assert reduced < baseline
+
+    def test_reset_restores_scale(self):
+        risk = make_risk()
+        risk.set_session_balance(100.0)
+        risk.check_drawdown(84.0)
+        assert risk.drawdown_scale == 0.25
+        risk.reset()
+        assert risk.drawdown_scale == 1.0
+
+
+class TestSlippageFactor:
+    def _sig(self, edge=0.30, price=0.30):
+        return make_signal(edge=edge, price=price)
+
+    def test_default_factor_is_one(self):
+        risk = make_risk()
+        assert risk.slippage_factor == 1.0
+
+    def test_set_factor_clamps_above_one(self):
+        risk = make_risk()
+        risk.set_slippage_factor(1.5)
+        assert risk.slippage_factor == 1.0
+
+    def test_set_factor_clamps_below_floor(self):
+        risk = make_risk()
+        risk.set_slippage_factor(0.1)
+        assert risk.slippage_factor == 0.3
+
+    def test_none_resets_factor(self):
+        risk = make_risk()
+        risk.set_slippage_factor(0.5)
+        risk.set_slippage_factor(None)
+        assert risk.slippage_factor == 1.0
+
+    def test_slippage_factor_reduces_size_order(self):
+        risk = make_risk(max_daily_spend=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
+        sig = self._sig(edge=0.30, price=0.30)
+
+        baseline = risk.size_order(sig, current_balance=1000.0, open_positions=0)
+        risk.set_slippage_factor(0.5)
+        reduced = risk.size_order(sig, current_balance=1000.0, open_positions=0)
+
+        assert baseline > 0
+        assert reduced < baseline

@@ -80,6 +80,50 @@ class TestLogOrder:
         assert order.order_id in content
 
 
+class TestGetSlippageFactor:
+    def test_returns_none_when_insufficient_data(self, store):
+        assert store.get_slippage_factor(min_trades=5) is None
+
+    def test_ratio_clamped_to_one_when_realized_exceeds_predicted(self, store):
+        # predicted edge=0.10, realized edge=0.20 → ratio 2.0, clamped to 1.0
+        for i in range(5):
+            order = _make_order(order_id=f"ord-{i}", status="filled", fill_count=1, taker_fill_cost=0.45)
+            store.log_order(order, theo_prob=0.67, gross_edge=0.15, edge=0.10, fee=0.05)
+            store._conn.execute(
+                "UPDATE orders SET realized_edge = 0.20 WHERE order_id = ?",
+                (order.order_id,),
+            )
+        store._conn.commit()
+        factor = store.get_slippage_factor(min_trades=5)
+        assert factor == 1.0
+
+    def test_ratio_below_one_when_realized_is_less_than_predicted(self, store):
+        # predicted edge=0.20, realized edge=0.10 → ratio 0.5
+        for i in range(5):
+            order = _make_order(order_id=f"ord-{i}", status="filled", fill_count=1, taker_fill_cost=0.45)
+            store.log_order(order, theo_prob=0.67, gross_edge=0.25, edge=0.20, fee=0.05)
+            store._conn.execute(
+                "UPDATE orders SET realized_edge = 0.10 WHERE order_id = ?",
+                (order.order_id,),
+            )
+        store._conn.commit()
+        factor = store.get_slippage_factor(min_trades=5)
+        assert factor == pytest.approx(0.5)
+
+    def test_ratio_floored_at_0_3(self, store):
+        # predicted=0.20, realized=0.01 → ratio ~0.05, floored to 0.3
+        for i in range(5):
+            order = _make_order(order_id=f"ord-{i}", status="filled", fill_count=1, taker_fill_cost=0.45)
+            store.log_order(order, theo_prob=0.67, gross_edge=0.25, edge=0.20, fee=0.05)
+            store._conn.execute(
+                "UPDATE orders SET realized_edge = 0.01 WHERE order_id = ?",
+                (order.order_id,),
+            )
+        store._conn.commit()
+        factor = store.get_slippage_factor(min_trades=5)
+        assert factor == 0.3
+
+
 class TestProbCalibrationBias:
     def test_returns_none_when_no_data(self, store):
         result = store.get_prob_calibration_bias(min_trades=1)

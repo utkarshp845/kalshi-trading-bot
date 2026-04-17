@@ -334,6 +334,39 @@ class Store:
             return None
         return float(row[0])
 
+    def get_slippage_factor(
+        self,
+        min_trades: int = 10,
+        lookback_days: int = 14,
+    ) -> Optional[float]:
+        """
+        Return avg(realized_edge) / avg(predicted_edge) over recent buy fills.
+
+        Returns None if fewer than min_trades are available. Otherwise clamped
+        to [0.3, 1.0]: never boosts sizing above 1.0; floors at 0.3 to prevent
+        a few bad cycles from silencing the bot entirely.
+        """
+        from datetime import timedelta as _td
+        lookback_date = (
+            datetime.now(timezone.utc) - _td(days=lookback_days)
+        ).isoformat()[:10]
+        row = self._conn.execute("""
+            SELECT AVG(realized_edge), AVG(edge), COUNT(*)
+              FROM orders
+             WHERE realized_edge IS NOT NULL
+               AND edge IS NOT NULL
+               AND edge > 0
+               AND action = 'buy'
+               AND logged_at >= ?
+        """, (lookback_date,)).fetchone()
+        if row is None or row[2] is None or row[2] < min_trades:
+            return None
+        avg_realized, avg_predicted, _ = row
+        if avg_predicted is None or avg_predicted <= 0:
+            return None
+        ratio = float(avg_realized) / float(avg_predicted)
+        return max(0.3, min(1.0, ratio))
+
     def get_todays_spend(self) -> float:
         today = _now_iso()[:10]
         row = self._conn.execute(

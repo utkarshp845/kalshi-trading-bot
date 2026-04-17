@@ -68,6 +68,21 @@ EXIT_LOSS_TRIGGER: float = _float("EXIT_LOSS_TRIGGER", 0.40)  # exit when theore
 # --- Smart Order Placement ---
 ENABLE_PRICE_IMPROVEMENT: bool = _bool("ENABLE_PRICE_IMPROVEMENT", True)
 PRICE_IMPROVEMENT_TIMEOUT_SEC: int = _int("PRICE_IMPROVEMENT_TIMEOUT_SEC", 45)  # wait this long for mid-price fill
+# Stale order monitoring: during the mid-price wait, poll BTC spot; cancel if it drifts past this threshold
+STALE_ORDER_POLL_SEC: int = _int("STALE_ORDER_POLL_SEC", 10)
+STALE_ORDER_SPOT_MOVE_PCT: float = _float("STALE_ORDER_SPOT_MOVE_PCT", 0.003)  # 0.3% BTC move invalidates the mid quote
+
+# --- Slippage-Adjusted Sizing ---
+# Scale Kelly bet size by empirical avg(realized_edge) / avg(predicted_edge) from recent fills
+SLIPPAGE_ADJUSTMENT_MIN_TRADES: int = _int("SLIPPAGE_ADJUSTMENT_MIN_TRADES", 10)
+SLIPPAGE_ADJUSTMENT_LOOKBACK_DAYS: int = _int("SLIPPAGE_ADJUSTMENT_LOOKBACK_DAYS", 14)
+
+# --- Graduated Drawdown ---
+# Scale position sizing down as drawdown grows, before the hard halt at MAX_DRAWDOWN_PCT
+DRAWDOWN_TIER_1_PCT: float = _float("DRAWDOWN_TIER_1_PCT", 0.10)    # 10% drawdown
+DRAWDOWN_TIER_1_SCALE: float = _float("DRAWDOWN_TIER_1_SCALE", 0.50)  # scale sizing to 50%
+DRAWDOWN_TIER_2_PCT: float = _float("DRAWDOWN_TIER_2_PCT", 0.15)    # 15% drawdown
+DRAWDOWN_TIER_2_SCALE: float = _float("DRAWDOWN_TIER_2_SCALE", 0.25)  # scale sizing to 25%
 
 # --- Monitoring ---
 ALERT_WEBHOOK_URL: str = os.getenv("ALERT_WEBHOOK_URL", "")  # Slack/Discord webhook; empty = log only
