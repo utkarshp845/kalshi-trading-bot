@@ -16,6 +16,7 @@ build/
 # Runtime data
 data/
 logs/
+reports/*.md
 
 # IDE
 .vscode/
