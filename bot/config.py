@@ -81,6 +81,7 @@ FORCE_TRADING_HOURS: bool = _bool("FORCE_TRADING_HOURS", False)
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
+REPORTS_DIR = BASE_DIR / "reports"
 DB_PATH = DATA_DIR / "bot.db"
 LOG_PATH = LOGS_DIR / "bot.log"
 TRADES_CSV = LOGS_DIR / "trades.csv"

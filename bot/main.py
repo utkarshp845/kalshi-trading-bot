@@ -20,6 +20,7 @@ from bot.kalshi_client import KalshiClient, Order, Position
 from bot.monitor import alert
 from bot.price_feed import get_btc_price_and_vol
 from bot.pricing import calc_prob
+from bot.report import generate_report
 from bot.risk import DailyRisk
 from bot.store import Store
 from bot.strategy import _hours_to_expiry, _parse_strike, scan_markets
@@ -521,6 +522,14 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         iv_rv_ratio=iv_rv_ratio,
         adaptive_safety_margin=adaptive_margin,
     )
+
+    # Refresh today's report so the user always has an up-to-date summary.
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        generate_report(today, cfg.DB_PATH, cfg.REPORTS_DIR)
+    except Exception as e:
+        log.warning("Daily report generation failed: %s", e)
+
     log.info("--- Cycle end: %d signal(s), %d order(s) placed ---", len(signals), orders_placed)
 
 
