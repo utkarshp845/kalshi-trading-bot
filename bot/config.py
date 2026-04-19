@@ -36,8 +36,16 @@ KALSHI_BASE_URL: str = os.getenv(
 )
 KALSHI_TAKER_FEE: float = _float("KALSHI_TAKER_FEE", 0.07)  # dollars per contract
 
+# --- Underlyings ---
+# Each enabled underlying is scanned independently per cycle. Signals are then
+# combined and ordered by net edge before risk gating.
+ENABLE_BTC: bool = _bool("ENABLE_BTC", True)
+ENABLE_ETH: bool = _bool("ENABLE_ETH", True)
+
 # --- Strategy ---
 MIN_EDGE: float = _float("MIN_EDGE", 0.15)          # was 0.08 — raised to require stronger edges
+USE_DRIFT: bool = _bool("USE_DRIFT", True)          # include trailing drift μ in the log-normal pricer
+DRIFT_LOOKBACK_DAYS: int = _int("DRIFT_LOOKBACK_DAYS", 30)  # window for the trailing log-return drift estimate
 MIN_T_HOURS: float = _float("MIN_T_HOURS", 1.0)     # was 0.5 — avoid noisy near-expiry markets
 VOL_SHORT_DAYS: int = _int("VOL_SHORT_DAYS", 7)      # fast vol: used for signal probability
 VOL_LONG_DAYS: int = _int("VOL_LONG_DAYS", 30)       # slow vol: logged as regime reference
@@ -49,7 +57,8 @@ MAX_BID_ASK_PCT_SPREAD: float = _float("MAX_BID_ASK_PCT_SPREAD", 0.30)  # skip i
 MAX_LAST_PRICE_DIVERGENCE: float = _float("MAX_LAST_PRICE_DIVERGENCE", 0.15)  # skip if last_price diverges > 0.15 from yes_mid (stale/moving market)
 
 # --- Risk ---
-MAX_DAILY_SPEND: float = _float("MAX_DAILY_SPEND", 5.0)   # was 100 — protect small bankrolls
+DAILY_SPEND_PCT: float = _float("DAILY_SPEND_PCT", 0.10)      # fraction of balance allowed to spend per day
+DAILY_SPEND_FLOOR: float = _float("DAILY_SPEND_FLOOR", 5.0)   # minimum daily cap regardless of balance
 MAX_CONTRACTS_PER_MARKET: int = _int("MAX_CONTRACTS_PER_MARKET", 3)  # was 10
 MAX_POSITIONS: int = _int("MAX_POSITIONS", 2)              # was 5 — fewer correlated positions
 KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.10)    # was 0.25 — much more conservative
@@ -61,9 +70,20 @@ IV_CALIBRATION_MIN_OBS: int = _int("IV_CALIBRATION_MIN_OBS", 10)     # min cycle
 IV_SAFETY_MARGIN_MIN: float = _float("IV_SAFETY_MARGIN_MIN", 1.05)   # clamp adaptive margin to this floor
 IV_SAFETY_MARGIN_MAX: float = _float("IV_SAFETY_MARGIN_MAX", 3.0)    # clamp adaptive margin to this ceiling
 
+# --- Deribit IV blend ---
+# When enabled, the cycle pulls live ATM IV from Deribit's public option chain
+# and blends it with realized vol: σ_blended = (1-w)·σ_realized + w·σ_deribit.
+# Deribit is forward-looking; RV is backward-looking. The blend defaults to
+# 60/40 in favor of Deribit (when available). Falls back to RV silently on error.
+ENABLE_DERIBIT_IV: bool = _bool("ENABLE_DERIBIT_IV", True)
+DERIBIT_IV_WEIGHT: float = _float("DERIBIT_IV_WEIGHT", 0.60)
+DERIBIT_MIN_DTE_HOURS: float = _float("DERIBIT_MIN_DTE_HOURS", 6.0)
+
 # --- Position Exit ---
 ENABLE_POSITION_EXIT: bool = _bool("ENABLE_POSITION_EXIT", True)
 EXIT_LOSS_TRIGGER: float = _float("EXIT_LOSS_TRIGGER", 0.40)  # exit when theoretical value drops to 40% of entry price
+TAKE_PROFIT_TRIGGER: float = _float("TAKE_PROFIT_TRIGGER", 2.0)  # exit when theoretical value rises to ≥ 2.0× entry price
+TAKE_PROFIT_MIN_HOURS: float = _float("TAKE_PROFIT_MIN_HOURS", 0.5)  # only take profit if there are still ≥ this many hours of decay risk left
 
 # --- Smart Order Placement ---
 ENABLE_PRICE_IMPROVEMENT: bool = _bool("ENABLE_PRICE_IMPROVEMENT", True)

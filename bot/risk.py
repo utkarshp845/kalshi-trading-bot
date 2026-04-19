@@ -30,7 +30,8 @@ class DailyRisk:
 
     def __init__(
         self,
-        max_daily_spend: float,
+        daily_spend_pct: float,
+        daily_spend_floor: float,
         max_contracts_per_market: int,
         max_positions: int,
         kelly_fraction: float,
@@ -41,7 +42,8 @@ class DailyRisk:
         drawdown_tier_2_pct: float = 0.15,
         drawdown_tier_2_scale: float = 0.25,
     ):
-        self.max_daily_spend = max_daily_spend
+        self.daily_spend_pct = daily_spend_pct
+        self.daily_spend_floor = daily_spend_floor
         self.max_contracts_per_market = max_contracts_per_market
         self.max_positions = max_positions
         self.kelly_fraction = kelly_fraction
@@ -55,6 +57,7 @@ class DailyRisk:
         self._daily_spent: float = 0.0
         self._positions_opened: int = 0
         self._session_start_balance: float = 0.0
+        self._max_daily_spend: float = daily_spend_floor  # updated each cycle via set_session_balance
         self._drawdown_halt: bool = False
         self._drawdown_scale: float = 1.0
         self._slippage_factor: float = 1.0
@@ -64,10 +67,19 @@ class DailyRisk:
     # ------------------------------------------------------------------
 
     def set_session_balance(self, balance: float) -> None:
-        """Set the starting balance for drawdown tracking."""
+        """Set the starting balance for drawdown tracking and recompute the daily spend cap."""
         if self._session_start_balance <= 0:
             self._session_start_balance = balance
             log.info("Session start balance set: $%.2f", balance)
+
+        new_cap = max(self.daily_spend_floor, self.daily_spend_pct * balance)
+        if abs(new_cap - self._max_daily_spend) > 0.01:
+            log.info(
+                "Daily spend cap: $%.2f → $%.2f (%.0f%% of $%.2f, floor $%.2f)",
+                self._max_daily_spend, new_cap,
+                self.daily_spend_pct * 100, balance, self.daily_spend_floor,
+            )
+            self._max_daily_spend = new_cap
 
     def reset(self) -> None:
         """Call at the start of each new trading day."""
@@ -103,6 +115,10 @@ class DailyRisk:
     @property
     def daily_spent(self) -> float:
         return self._daily_spent
+
+    @property
+    def max_daily_spend(self) -> float:
+        return self._max_daily_spend
 
     @property
     def positions_opened(self) -> float:
@@ -166,8 +182,8 @@ class DailyRisk:
         if self._drawdown_halt:
             log.info("Risk gate: drawdown halt active — no new trades")
             return False
-        if self._daily_spent >= self.max_daily_spend:
-            log.info("Risk gate: daily spend cap reached (%.2f / %.2f)", self._daily_spent, self.max_daily_spend)
+        if self._daily_spent >= self._max_daily_spend:
+            log.info("Risk gate: daily spend cap reached (%.2f / %.2f)", self._daily_spent, self._max_daily_spend)
             return False
         if open_positions >= self.max_positions:
             log.info("Risk gate: max open positions reached (%d)", open_positions)
@@ -183,7 +199,7 @@ class DailyRisk:
         remaining daily cap and a fraction of actual account balance.
         Applies a correlation discount for multiple open positions.
         """
-        remaining_daily = self.max_daily_spend - self._daily_spent
+        remaining_daily = self._max_daily_spend - self._daily_spent
         if remaining_daily <= 0:
             return 0
 

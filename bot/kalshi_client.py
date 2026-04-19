@@ -154,13 +154,17 @@ class KalshiClient:
     # Markets
     # ------------------------------------------------------------------
 
+    def get_open_markets(self, series_ticker: str) -> list[Market]:
+        """Return all open Kalshi markets for a given series (e.g. 'KXBTC', 'KXETH')."""
+        path = "/markets"
+        data = self._get(path, params={"series_ticker": series_ticker, "status": "open"})
+        markets = [Market.from_dict(m) for m in data.get("markets", [])]
+        log.debug("Found %d open %s markets", len(markets), series_ticker)
+        return markets
+
     def get_open_btc_markets(self) -> list[Market]:
         """Return all open Kalshi BTC daily price-level markets (series KXBTC)."""
-        path = "/markets"
-        data = self._get(path, params={"series_ticker": "KXBTC", "status": "open"})
-        markets = [Market.from_dict(m) for m in data.get("markets", [])]
-        log.debug("Found %d open KXBTC markets", len(markets))
-        return markets
+        return self.get_open_markets("KXBTC")
 
     def get_market(self, ticker: str) -> Market:
         path = f"/markets/{ticker}"

@@ -1,9 +1,9 @@
 """
-Mispricing arbitrage strategy for Kalshi BTC daily price-level markets.
+Mispricing arbitrage strategy for Kalshi BTC/ETH daily price-level markets.
 
 Parses the strike from each market ticker, computes the theoretical
-probability via the log-normal model, and returns a trade signal when
-the edge exceeds the configured minimum.
+probability via the log-normal model (with optional drift), and returns a
+trade signal when the edge exceeds the configured minimum.
 """
 from typing import Optional
 import logging
@@ -65,6 +65,7 @@ def evaluate(
     max_bid_ask_spread: float = 0.25,
     max_bid_ask_pct_spread: float = 0.30,
     max_last_price_divergence: float = 0.15,
+    mu: float = 0.0,
 ) -> tuple[Optional["Signal"], str]:
     """
     Evaluate one Kalshi market and return a Signal if an edge exists, else None.
@@ -115,7 +116,7 @@ def evaluate(
             return None, "last_price_diverge"
 
     T_years = T_hours / 8760.0
-    theo_prob = calc_prob(spot_price, strike, T_years, sigma)
+    theo_prob = calc_prob(spot_price, strike, T_years, sigma, mu=mu)
 
     # Gross edge = theoretical value minus ask price
     # Net edge = gross edge minus taker fee (fee is per contract in dollar terms)
@@ -176,6 +177,7 @@ def scan_markets(
     max_bid_ask_spread: float = 0.25,
     max_bid_ask_pct_spread: float = 0.30,
     max_last_price_divergence: float = 0.15,
+    mu: float = 0.0,
 ) -> list[Signal]:
     """
     Evaluate all markets and return signals sorted by net edge (highest first).
@@ -194,6 +196,7 @@ def scan_markets(
             fee=fee, max_bid_ask_spread=max_bid_ask_spread,
             max_bid_ask_pct_spread=max_bid_ask_pct_spread,
             max_last_price_divergence=max_last_price_divergence,
+            mu=mu,
         )
         if sig:
             signals.append(sig)

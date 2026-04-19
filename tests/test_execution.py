@@ -51,7 +51,7 @@ class FakeKalshi:
 def _fast_price_improvement(monkeypatch):
     """Don't actually sleep or hit the network during tests."""
     monkeypatch.setattr(main_mod.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(main_mod, "get_spot_price", lambda: 95000.0)
+    monkeypatch.setattr(main_mod, "get_spot_price", lambda symbol="BTC": 95000.0)
     monkeypatch.setattr(cfg, "ENABLE_PRICE_IMPROVEMENT", True)
     monkeypatch.setattr(cfg, "PRICE_IMPROVEMENT_TIMEOUT_SEC", 0)
     monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 10)
@@ -137,7 +137,7 @@ class TestExecuteWithPriceImprovement:
         monkeypatch.setattr(cfg, "STALE_ORDER_SPOT_MOVE_PCT", 0.003)
         # Entry spot 95000; first poll sees 95500 (~0.53% drift) → cancel
         spot_sequence = iter([95000.0, 95500.0])
-        monkeypatch.setattr(main_mod, "get_spot_price", lambda: next(spot_sequence))
+        monkeypatch.setattr(main_mod, "get_spot_price", lambda symbol="BTC": next(spot_sequence))
 
         mid_partial = _order("o1", count=10, fill_count=0, fill_cost=0.0, price=0.42)
         kalshi = FakeKalshi(
@@ -163,7 +163,7 @@ class TestExecuteWithPriceImprovement:
         monkeypatch.setattr(cfg, "STALE_ORDER_SPOT_MOVE_PCT", 0.01)  # 1% tolerance
         # Entry 95000, poll sees 95100 (~0.1% drift, under threshold)
         spot_sequence = iter([95000.0, 95100.0])
-        monkeypatch.setattr(main_mod, "get_spot_price", lambda: next(spot_sequence))
+        monkeypatch.setattr(main_mod, "get_spot_price", lambda symbol="BTC": next(spot_sequence))
 
         mid_partial = _order("o1", count=10, fill_count=3, fill_cost=1.26, price=0.42)
         ask_fill = _order("o2", count=7, fill_count=7, fill_cost=3.15, price=0.45)

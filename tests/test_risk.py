@@ -6,7 +6,8 @@ from tests.conftest import make_signal
 
 def make_risk(**kwargs) -> DailyRisk:
     defaults = dict(
-        max_daily_spend=10.0,
+        daily_spend_pct=0.10,
+        daily_spend_floor=10.0,
         max_contracts_per_market=3,
         max_positions=2,
         kelly_fraction=0.10,
@@ -27,7 +28,7 @@ class TestCanTrade:
         assert risk.can_trade(open_positions=2) is False
 
     def test_blocked_when_daily_spend_reached(self):
-        risk = make_risk(max_daily_spend=5.0)
+        risk = make_risk(daily_spend_floor=5.0)
         risk._daily_spent = 5.0
         assert risk.can_trade(open_positions=0) is False
 
@@ -78,27 +79,27 @@ class TestSizeOrder:
         assert risk.size_order(sig, current_balance=50.0) == 0
 
     def test_capped_at_max_contracts_per_market(self):
-        risk = make_risk(max_contracts_per_market=2, max_daily_spend=1000.0, kelly_fraction=1.0)
+        risk = make_risk(max_contracts_per_market=2, daily_spend_floor=1000.0, kelly_fraction=1.0)
         n = risk.size_order(self._sig(edge=0.80, price=0.10), current_balance=10000.0)
         assert n <= 2
 
     def test_correlation_discount_reduces_size(self):
-        risk = make_risk(max_daily_spend=1000.0, kelly_fraction=0.50)
+        risk = make_risk(daily_spend_floor=1000.0, kelly_fraction=0.50, max_contracts_per_market=1000)
         sig = self._sig(edge=0.25, price=0.30)
         n_no_pos = risk.size_order(sig, current_balance=500.0, open_positions=0)
         n_one_pos = risk.size_order(sig, current_balance=500.0, open_positions=1)
         # With one open position the 0.7^1 discount should reduce size
-        assert n_one_pos <= n_no_pos
+        assert n_one_pos < n_no_pos
 
     def test_returns_zero_when_budget_exhausted(self):
-        risk = make_risk(max_daily_spend=5.0)
+        risk = make_risk(daily_spend_floor=5.0)
         risk._daily_spent = 5.0
         assert risk.size_order(self._sig(), current_balance=50.0) == 0
 
     def test_balance_aware_limits_above_daily_cap(self):
-        # balance=4.0, bankroll_fraction=0.25 → limit = 1.0
-        # daily cap=10.0, so effective = min(10.0, 1.0) = 1.0
-        risk = make_risk(max_daily_spend=10.0, bankroll_fraction=0.25, max_contracts_per_market=100)
+        # balance=4.0, bankroll_fraction=0.25 → balance limit = 1.0
+        # daily cap floor=10.0, so effective = min(10.0, 1.0) = 1.0
+        risk = make_risk(daily_spend_floor=10.0, bankroll_fraction=0.25, max_contracts_per_market=100)
         sig = make_signal(edge=0.30, price=0.10)
         n = risk.size_order(sig, current_balance=4.0, open_positions=0)
         # Effective budget = 1.0, kelly_f ≈ 0.30/0.90 ≈ 0.33, spend ≈ 0.33 * 0.10 * 1.0 = 0.033
@@ -151,7 +152,7 @@ class TestGraduatedDrawdown:
 
     def test_drawdown_scale_reduces_size_order(self):
         # Large budget so Kelly-based sizing dominates
-        risk = make_risk(max_daily_spend=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
+        risk = make_risk(daily_spend_floor=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
         risk.set_session_balance(1000.0)
         sig = self._sig(edge=0.30, price=0.30)
 
@@ -159,7 +160,7 @@ class TestGraduatedDrawdown:
         baseline = risk.size_order(sig, current_balance=1000.0, open_positions=0)
 
         # Tier 1 (10%): scale 0.5 → roughly half the contracts
-        risk2 = make_risk(max_daily_spend=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
+        risk2 = make_risk(daily_spend_floor=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
         risk2.set_session_balance(1000.0)
         risk2.check_drawdown(900.0)  # -10%
         reduced = risk2.size_order(sig, current_balance=900.0, open_positions=0)
@@ -201,7 +202,7 @@ class TestSlippageFactor:
         assert risk.slippage_factor == 1.0
 
     def test_slippage_factor_reduces_size_order(self):
-        risk = make_risk(max_daily_spend=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
+        risk = make_risk(daily_spend_floor=1000.0, kelly_fraction=1.0, max_contracts_per_market=1000)
         sig = self._sig(edge=0.30, price=0.30)
 
         baseline = risk.size_order(sig, current_balance=1000.0, open_positions=0)
