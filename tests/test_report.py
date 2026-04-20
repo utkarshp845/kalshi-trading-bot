@@ -42,7 +42,7 @@ class TestGenerateReport:
         out = generate_report(today, store._db_path, tmp_path / "reports")
         assert out.exists()
         content = out.read_text()
-        assert f"Daily Report — {today}" in content
+        assert f"Daily Report - {today}" in content
         assert "No orders placed" in content
         assert "No run records" in content
 
@@ -99,8 +99,8 @@ class TestGenerateReport:
         out = generate_report(today, store._db_path, tmp_path / "reports")
         content = out.read_text()
         assert "Cycles run: 2" in content
-        assert "$95,000 – $95,500" in content
-        assert "8 → 3" in content  # total signals → orders
+        assert "$95,000 - $95,500" in content
+        assert "8 -> 3" in content  # total signals -> orders
 
     def test_snapshot_appears_in_summary(self, store, tmp_path):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")

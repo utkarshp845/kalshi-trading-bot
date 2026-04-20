@@ -30,7 +30,7 @@ class Signal:
     gross_edge: float # edge before fees
     edge: float       # net edge after taker fee
     fee: float        # taker fee deducted (dollars per contract)
-    theo_prob: float
+    theo_prob: float  # fair value of the selected contract side
     strike: float
     mid_price: float = 0.0      # bid-ask midpoint for price-improvement orders
     hours_to_expiry: float = 0.0
@@ -116,19 +116,20 @@ def evaluate(
             return None, "last_price_diverge"
 
     T_years = T_hours / 8760.0
-    theo_prob = calc_prob(spot_price, strike, T_years, sigma, mu=mu)
+    yes_theo_prob = calc_prob(spot_price, strike, T_years, sigma, mu=mu)
+    no_theo_prob = 1.0 - yes_theo_prob
 
     # Gross edge = theoretical value minus ask price
     # Net edge = gross edge minus taker fee (fee is per contract in dollar terms)
-    gross_yes = theo_prob - market.yes_ask
-    gross_no = (1.0 - theo_prob) - market.no_ask
+    gross_yes = yes_theo_prob - market.yes_ask
+    gross_no = no_theo_prob - market.no_ask
     net_yes = gross_yes - fee
     net_no = gross_no - fee
 
     log.debug(
         "%s K=%.0f S=%.0f T=%.2fh σ=%.4f → theo=%.4f  "
         "yes_ask=%.2f (gross %.4f net %.4f)  no_ask=%.2f (gross %.4f net %.4f)",
-        market.ticker, strike, spot_price, T_hours, sigma, theo_prob,
+        market.ticker, strike, spot_price, T_hours, sigma, yes_theo_prob,
         market.yes_ask, gross_yes, net_yes, market.no_ask, gross_no, net_no,
     )
 
@@ -151,6 +152,7 @@ def evaluate(
 
     ask_price = market.yes_ask if best_side == "yes" else market.no_ask
     mid = yes_mid if best_side == "yes" else no_mid
+    contract_theo_prob = yes_theo_prob if best_side == "yes" else no_theo_prob
 
     return Signal(
         ticker=market.ticker,
@@ -159,7 +161,7 @@ def evaluate(
         gross_edge=best_gross,
         edge=best_net,
         fee=fee,
-        theo_prob=theo_prob,
+        theo_prob=contract_theo_prob,
         strike=strike,
         mid_price=mid,
         hours_to_expiry=T_hours,

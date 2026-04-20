@@ -3,6 +3,7 @@ import math
 import pytest
 from datetime import datetime, timedelta, timezone
 
+from bot.pricing import calc_prob
 from bot.strategy import _parse_strike, _hours_to_expiry, evaluate, scan_markets
 from tests.conftest import make_market
 
@@ -157,6 +158,22 @@ class TestEvaluate:
         sig, _ = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
         assert sig is not None
         assert sig.side == "yes"  # deep ITM → YES edge
+
+    def test_no_signal_uses_no_contract_probability(self):
+        close = _future_close(4.0)
+        market = make_market(
+            ticker="KXBTC-26APR4PM-B120000",
+            yes_ask=0.15, yes_bid=0.12,
+            no_ask=0.55, no_bid=0.52,
+            close_time=close,
+        )
+
+        sig, _ = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE)
+
+        assert sig is not None
+        assert sig.side == "no"
+        yes_prob = calc_prob(SPOT, 120000.0, sig.hours_to_expiry / 8760.0, SIGMA)
+        assert sig.theo_prob == pytest.approx(1.0 - yes_prob)
 
     def test_mid_price_in_signal(self):
         market = self._market_with_edge()

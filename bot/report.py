@@ -169,23 +169,23 @@ def _avg(values: list[float]) -> Optional[float]:
 
 def _fmt_money(v: Optional[float]) -> str:
     if v is None:
-        return "—"
+        return "-"
     sign = "-" if v < 0 else ""
     return f"{sign}${abs(v):.2f}"
 
 
 def _fmt_signed_money(v: Optional[float]) -> str:
     if v is None:
-        return "—"
+        return "-"
     return f"{'+' if v >= 0 else '-'}${abs(v):.2f}"
 
 
 def _fmt_num(v: Optional[float], digits: int = 4) -> str:
-    return "—" if v is None else f"{v:.{digits}f}"
+    return "-" if v is None else f"{v:.{digits}f}"
 
 
 def _fmt_pct(v: Optional[float]) -> str:
-    return "—" if v is None else f"{v * 100:.2f}%"
+    return "-" if v is None else f"{v * 100:.2f}%"
 
 
 # ----------------------------------------------------------------------
@@ -200,7 +200,7 @@ def _render(
     runs: list[sqlite3.Row],
 ) -> str:
     lines: list[str] = []
-    lines.append(f"# Daily Report — {date_str}")
+    lines.append(f"# Daily Report - {date_str}")
     lines.append("")
     lines.append(f"_Generated {datetime.now(timezone.utc).isoformat(timespec='seconds')}_")
     lines.append("")
@@ -234,7 +234,7 @@ def _render(
         lines.append("|---|---|---|---|---|---|---|---|")
         for t in opened:
             tstamp = t.logged_at[11:19] if len(t.logged_at) >= 19 else t.logged_at
-            edge_str = _fmt_num(t.edge, 3) if t.edge is not None else "—"
+            edge_str = _fmt_num(t.edge, 3) if t.edge is not None else "-"
             lines.append(
                 f"| {tstamp} | {t.ticker} | {t.side} | {t.count} | {t.fill_count} | "
                 f"{_fmt_money(t.cost_dollars)} | {edge_str} | {t.status} |"
@@ -250,7 +250,7 @@ def _render(
         wins = sum(1 for t in settled if (t.settled_value or 0) >= 1.0)
         losses = len(settled) - wins
         win_rate = wins / len(settled) if settled else 0.0
-        lines.append(f"- Settled: {len(settled)}  ({wins}W / {losses}L — win rate {_fmt_pct(win_rate)})")
+        lines.append(f"- Settled: {len(settled)}  ({wins}W / {losses}L - win rate {_fmt_pct(win_rate)})")
         lines.append(f"- Realized P&L: {_fmt_signed_money(realized_pnl)}")
         lines.append("")
         lines.append("| Ticker | Side | Qty | Cost | Outcome | P&L |")
@@ -278,7 +278,7 @@ def _render(
         lines.append(f"- Avg realized edge (after slippage): {_fmt_num(avg_realized_edge, 4)}")
         if avg_pred_edge is not None and avg_realized_edge is not None:
             leak = avg_pred_edge - avg_realized_edge
-            lines.append(f"- Edge leak (predicted − realized): {_fmt_num(leak, 4)}")
+            lines.append(f"- Edge leak (predicted - realized): {_fmt_num(leak, 4)}")
     else:
         lines.append("_No fill-quality data for this date._")
     lines.append("")
@@ -294,13 +294,13 @@ def _render(
     if cal_samples:
         bias = sum(sv - tp for sv, tp in cal_samples) / len(cal_samples)
         lines.append(f"- Samples (settled today with predictions): {len(cal_samples)}")
-        lines.append(f"- Avg (settled − predicted): {_fmt_num(bias, 4)}")
+        lines.append(f"- Avg (settled - predicted): {_fmt_num(bias, 4)}")
         if bias > 0.05:
             lines.append("  - Model is **under-predicting** probability; consider tightening safety margin.")
         elif bias < -0.05:
             lines.append("  - Model is **over-predicting** probability; consider widening safety margin.")
         else:
-            lines.append("  - Model calibration within ±5% tolerance.")
+            lines.append("  - Model calibration within +/-5% tolerance.")
     else:
         lines.append("_Not enough settled+predicted samples for today's calibration._")
     lines.append("")
@@ -323,11 +323,11 @@ def _render(
 
         lines.append(f"- Cycles run: {len(runs)}")
         if btc_prices:
-            lines.append(f"- BTC range: ${min(btc_prices):,.0f} – ${max(btc_prices):,.0f}")
-        lines.append(f"- Avg σ_short/σ_long: {_fmt_num(_avg(vol_ratios), 3)}")
+            lines.append(f"- BTC range: ${min(btc_prices):,.0f} - ${max(btc_prices):,.0f}")
+        lines.append(f"- Avg sigma_short/sigma_long: {_fmt_num(_avg(vol_ratios), 3)}")
         lines.append(f"- Avg IV/RV ratio: {_fmt_num(_avg(iv_rv_ratios), 3)}")
         lines.append(f"- Avg adaptive safety margin: {_fmt_num(_avg(margins), 3)}")
-        lines.append(f"- Signals found → orders placed: {total_signals} → {total_orders}"
+        lines.append(f"- Signals found -> orders placed: {total_signals} -> {total_orders}"
                      + (f" ({_fmt_pct(conversion)})" if conversion is not None else ""))
     else:
         lines.append("_No run records for this date._")
@@ -340,8 +340,8 @@ def _render(
         lines.append("")
         best = max(realized_trades, key=lambda t: t.settled_pnl)
         worst = min(realized_trades, key=lambda t: t.settled_pnl)
-        lines.append(f"- **Best**: {best.ticker} ({best.side}) → {_fmt_signed_money(best.settled_pnl)}")
-        lines.append(f"- **Worst**: {worst.ticker} ({worst.side}) → {_fmt_signed_money(worst.settled_pnl)}")
+        lines.append(f"- **Best**: {best.ticker} ({best.side}) -> {_fmt_signed_money(best.settled_pnl)}")
+        lines.append(f"- **Worst**: {worst.ticker} ({worst.side}) -> {_fmt_signed_money(worst.settled_pnl)}")
         lines.append("")
 
     return "\n".join(lines)
@@ -379,7 +379,7 @@ def generate_report(
 
     content = _render(date_str, opened, settled, snapshot, runs)
     out_path = reports_dir / f"{date_str}.md"
-    out_path.write_text(content)
+    out_path.write_text(content, encoding="utf-8")
     return out_path
 
 

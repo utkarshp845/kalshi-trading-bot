@@ -93,6 +93,11 @@ class Store:
                 orders_placed   INTEGER,
                 dry_run         INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key             TEXT PRIMARY KEY,
+                value           TEXT NOT NULL
+            );
         """)
         # Migrate existing databases that predate the new columns
         self._migrate()
@@ -137,6 +142,44 @@ class Store:
         for col, col_type in run_cols.items():
             if col not in existing_runs:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {col_type}")
+
+        self._backfill_legacy_no_side_orders()
+
+    def _backfill_legacy_no_side_orders(self) -> None:
+        """
+        Repair legacy NO-side buy orders that stored the YES probability in
+        theo_prob. This backfill runs once and also refreshes realized_edge for
+        rows that already have fill prices recorded.
+        """
+        migration_key = "backfill_no_side_contract_prob_v1"
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (migration_key,),
+        ).fetchone()
+        if row is not None:
+            return
+
+        updated = self._conn.execute("""
+            UPDATE orders
+               SET theo_prob = 1.0 - theo_prob
+             WHERE action = 'buy'
+               AND side = 'no'
+               AND theo_prob IS NOT NULL
+        """).rowcount
+        self._conn.execute("""
+            UPDATE orders
+               SET realized_edge = theo_prob - fill_price_dollars - COALESCE(fee, 0.0)
+             WHERE action = 'buy'
+               AND side = 'no'
+               AND theo_prob IS NOT NULL
+               AND fill_price_dollars IS NOT NULL
+        """)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (migration_key, _now_iso()),
+        )
+        if updated:
+            log.info("Backfilled %d legacy NO-side order(s) with contract probabilities", updated)
 
     # ------------------------------------------------------------------
     # Write methods

@@ -205,20 +205,22 @@ def run(dry_run: bool) -> None:
 
 def _apply_calibration(store: Store) -> None:
     """
-    Query settled order outcomes and nudge VOL_SAFETY_MARGIN up/down by ±5%
-    if the model is systematically mis-calibrated. Clamp to [1.0, 2.5].
+    Log settled-trade calibration bias for visibility.
+
+    We do not mutate VOL_SAFETY_MARGIN here. Settled trade outcomes are a
+    selection-biased sample of only the contracts we chose to trade, and a
+    single global vol nudge moves YES/NO probabilities in different directions
+    across strikes. The market-implied IV/RV margin remains the only automatic
+    volatility calibration mechanism.
     """
     bias = store.get_prob_calibration_bias(min_trades=10, lookback_days=30)
     if bias is None:
         log.info("Calibration: insufficient settled trades — using static VOL_SAFETY_MARGIN=%.3f", cfg.VOL_SAFETY_MARGIN)
         return
-    direction = math.copysign(1.0, bias)
-    new_margin = max(1.0, min(2.5, cfg.VOL_SAFETY_MARGIN * (1.0 + 0.05 * direction)))
     log.info(
-        "Calibration: prob_bias=%.4f → adjusting VOL_SAFETY_MARGIN %.3f → %.3f",
-        bias, cfg.VOL_SAFETY_MARGIN, new_margin,
+        "Calibration: prob_bias=%.4f (informational only; VOL_SAFETY_MARGIN unchanged at %.3f)",
+        bias, cfg.VOL_SAFETY_MARGIN,
     )
-    cfg.VOL_SAFETY_MARGIN = new_margin
 
 
 def _check_fills(kalshi: KalshiClient, store: Store) -> None:

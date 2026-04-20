@@ -80,6 +80,68 @@ class TestLogOrder:
         assert order.order_id in content
 
 
+class TestUpdateOrderFill:
+    def test_realized_edge_for_no_side_uses_logged_contract_probability(self, store):
+        order = _make_order(
+            order_id="no-1",
+            side="no",
+            yes_price=0.0,
+            no_price=0.55,
+            status="resting",
+        )
+        store.log_order(order, theo_prob=0.82, gross_edge=0.27, edge=0.20, fee=0.07)
+
+        filled = _make_order(
+            order_id="no-1",
+            side="no",
+            yes_price=0.0,
+            no_price=0.55,
+            status="filled",
+            fill_count=2,
+            taker_fill_cost=1.00,
+        )
+        store.update_order_fill(filled)
+
+        row = store._conn.execute(
+            "SELECT fill_price_dollars, realized_edge FROM orders WHERE order_id = ?",
+            ("no-1",),
+        ).fetchone()
+        assert row["fill_price_dollars"] == pytest.approx(0.50)
+        assert row["realized_edge"] == pytest.approx(0.82 - 0.50 - 0.07)
+
+
+class TestMigrations:
+    def test_backfills_legacy_no_side_probability_once(self, store):
+        order = _make_order(
+            order_id="legacy-no-1",
+            side="no",
+            yes_price=0.0,
+            no_price=0.55,
+            status="filled",
+            fill_count=2,
+            taker_fill_cost=1.00,
+        )
+        # Legacy bug: stored YES probability instead of NO contract probability.
+        store.log_order(order, theo_prob=0.18, gross_edge=0.27, edge=0.20, fee=0.07)
+        store._conn.execute(
+            "UPDATE orders SET fill_price_dollars = 0.50, realized_edge = -0.39 WHERE order_id = ?",
+            (order.order_id,),
+        )
+        store._conn.execute(
+            "DELETE FROM meta WHERE key = 'backfill_no_side_contract_prob_v1'",
+        )
+        store._conn.commit()
+
+        store._migrate()
+
+        row = store._conn.execute(
+            "SELECT theo_prob, realized_edge FROM orders WHERE order_id = ?",
+            (order.order_id,),
+        ).fetchone()
+        assert row["theo_prob"] == pytest.approx(0.82)
+        assert row["realized_edge"] == pytest.approx(0.82 - 0.50 - 0.07)
+
+
 class TestGetSlippageFactor:
     def test_returns_none_when_insufficient_data(self, store):
         assert store.get_slippage_factor(min_trades=5) is None
