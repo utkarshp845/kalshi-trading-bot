@@ -158,6 +158,32 @@ def _runs_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _asset_runs_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT symbol, spot, sigma_short, sigma_long, sigma_adjusted, health_status,
+               degraded, open_positions, run_at
+          FROM asset_runs
+         WHERE substr(run_at, 1, 10) = ?
+         ORDER BY run_at ASC, symbol ASC
+        """,
+        (date_str,),
+    ).fetchall()
+
+
+def _signal_decisions_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT symbol, ticker, side, eligible, score, required_edge,
+               expected_slippage, uncertainty_penalty, reject_reason, logged_at
+          FROM signal_decisions
+         WHERE substr(logged_at, 1, 10) = ?
+         ORDER BY logged_at ASC
+        """,
+        (date_str,),
+    ).fetchall()
+
+
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
@@ -198,6 +224,8 @@ def _render(
     settled: list[TradeRow],
     snapshot: Optional[sqlite3.Row],
     runs: list[sqlite3.Row],
+    asset_runs: list[sqlite3.Row],
+    signal_decisions: list[sqlite3.Row],
 ) -> str:
     lines: list[str] = []
     lines.append(f"# Daily Report - {date_str}")
@@ -333,6 +361,54 @@ def _render(
         lines.append("_No run records for this date._")
     lines.append("")
 
+    lines.append("## Decision Quality")
+    lines.append("")
+    if signal_decisions:
+        reject_counts: dict[str, int] = {}
+        eligible_by_symbol: dict[str, int] = {}
+        for row in signal_decisions:
+            symbol = row["symbol"] or "UNK"
+            if row["eligible"]:
+                eligible_by_symbol[symbol] = eligible_by_symbol.get(symbol, 0) + 1
+            else:
+                reason = row["reject_reason"] or "unknown"
+                reject_counts[reason] = reject_counts.get(reason, 0) + 1
+        lines.append(f"- Decisions logged: {len(signal_decisions)}")
+        if eligible_by_symbol:
+            summary = ", ".join(f"{symbol}={count}" for symbol, count in sorted(eligible_by_symbol.items()))
+            lines.append(f"- Eligible by symbol: {summary}")
+        if reject_counts:
+            top_rejects = sorted(reject_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+            lines.append("- Top reject reasons: " + ", ".join(f"{reason}={count}" for reason, count in top_rejects))
+    else:
+        lines.append("_No signal-decision records for this date._")
+    lines.append("")
+
+    lines.append("## Asset Diagnostics")
+    lines.append("")
+    if asset_runs:
+        by_symbol: dict[str, list[sqlite3.Row]] = {}
+        for row in asset_runs:
+            by_symbol.setdefault(row["symbol"], []).append(row)
+        for symbol, rows in sorted(by_symbol.items()):
+            degraded = sum(1 for row in rows if row["degraded"])
+            health_counts: dict[str, int] = {}
+            for row in rows:
+                status = row["health_status"] or "unknown"
+                health_counts[status] = health_counts.get(status, 0) + 1
+            spot_min = min(row["spot"] for row in rows if row["spot"] is not None)
+            spot_max = max(row["spot"] for row in rows if row["spot"] is not None)
+            symbol_settled = [t for t in settled if t.ticker.startswith(f"KX{symbol}")]
+            symbol_pnl = sum((t.settled_pnl or 0.0) for t in symbol_settled)
+            lines.append(
+                f"- {symbol}: cycles={len(rows)} degraded={degraded} "
+                f"spot=${spot_min:,.0f}-${spot_max:,.0f} settled_pnl={_fmt_signed_money(symbol_pnl)} "
+                f"health={','.join(f'{k}:{v}' for k, v in sorted(health_counts.items()))}"
+            )
+    else:
+        lines.append("_No asset-run records for this date._")
+    lines.append("")
+
     # --- Best / worst ---
     realized_trades = [t for t in settled if t.settled_pnl is not None]
     if realized_trades:
@@ -374,10 +450,12 @@ def generate_report(
         settled = _orders_settled_on(conn, date_str)
         snapshot = _latest_snapshot(conn, date_str)
         runs = _runs_on(conn, date_str)
+        asset_runs = _asset_runs_on(conn, date_str)
+        signal_decisions = _signal_decisions_on(conn, date_str)
     finally:
         conn.close()
 
-    content = _render(date_str, opened, settled, snapshot, runs)
+    content = _render(date_str, opened, settled, snapshot, runs, asset_runs, signal_decisions)
     out_path = reports_dir / f"{date_str}.md"
     out_path.write_text(content, encoding="utf-8")
     return out_path

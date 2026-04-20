@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bot.kalshi_client import Order
+from bot.models import AssetSnapshot, MarketFeature, SignalDecision
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS runs (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_at          TEXT NOT NULL,
+                cycle_id        TEXT,
                 btc_price       REAL,
                 sigma_short     REAL,
                 sigma_long      REAL,
@@ -97,6 +99,112 @@ class Store:
             CREATE TABLE IF NOT EXISTS meta (
                 key             TEXT PRIMARY KEY,
                 value           TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS asset_runs (
+                cycle_id                 TEXT NOT NULL,
+                run_at                   TEXT NOT NULL,
+                symbol                   TEXT NOT NULL,
+                series_ticker            TEXT NOT NULL,
+                spot                     REAL,
+                sigma_short              REAL,
+                sigma_long               REAL,
+                sigma_adjusted           REAL,
+                mu                       REAL,
+                iv_rv_ratio              REAL,
+                adaptive_margin          REAL,
+                spot_fetched_at          TEXT,
+                spot_freshness_sec       REAL,
+                spot_status              TEXT,
+                markets_fetched_at       TEXT,
+                markets_freshness_sec    REAL,
+                markets_status           TEXT,
+                iv_fetched_at            TEXT,
+                iv_freshness_sec         REAL,
+                iv_status                TEXT,
+                degraded                 INTEGER,
+                health_status            TEXT,
+                open_positions           INTEGER,
+                PRIMARY KEY (cycle_id, symbol)
+            );
+
+            CREATE TABLE IF NOT EXISTS market_snapshots (
+                cycle_id                 TEXT NOT NULL,
+                symbol                   TEXT NOT NULL,
+                ticker                   TEXT NOT NULL,
+                close_time               TEXT NOT NULL,
+                expiry_bucket            TEXT,
+                strike                   REAL,
+                side                     TEXT,
+                contract_theo_prob       REAL,
+                yes_theo_prob            REAL,
+                ask                      REAL,
+                bid                      REAL,
+                mid                      REAL,
+                yes_bid                  REAL,
+                yes_ask                  REAL,
+                no_bid                   REAL,
+                no_ask                   REAL,
+                spread_abs               REAL,
+                spread_pct               REAL,
+                gross_edge               REAL,
+                edge                     REAL,
+                fee                      REAL,
+                hours_to_expiry          REAL,
+                distance_from_spot_sigma REAL,
+                last_price_divergence    REAL,
+                chain_break_ratio        REAL,
+                chain_ok                 INTEGER,
+                enough_sane_strikes      INTEGER,
+                spread_ok                INTEGER,
+                last_price_ok            INTEGER,
+                PRIMARY KEY (cycle_id, ticker)
+            );
+
+            CREATE TABLE IF NOT EXISTS signal_decisions (
+                cycle_id                 TEXT NOT NULL,
+                symbol                   TEXT NOT NULL,
+                ticker                   TEXT NOT NULL,
+                side                     TEXT NOT NULL,
+                eligible                 INTEGER,
+                score                    REAL,
+                required_edge            REAL,
+                expected_slippage        REAL,
+                uncertainty_penalty      REAL,
+                reject_reason            TEXT,
+                theo_prob                REAL,
+                ask                      REAL,
+                bid                      REAL,
+                mid_price                REAL,
+                gross_edge               REAL,
+                edge                     REAL,
+                fee                      REAL,
+                hours_to_expiry          REAL,
+                strike                   REAL,
+                distance_from_spot_sigma REAL,
+                degraded                 INTEGER,
+                chain_break_ratio        REAL,
+                logged_at                TEXT NOT NULL,
+                PRIMARY KEY (cycle_id, ticker, side)
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_attempts (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id                 TEXT NOT NULL,
+                symbol                   TEXT NOT NULL,
+                ticker                   TEXT NOT NULL,
+                side                     TEXT NOT NULL,
+                trading_mode             TEXT NOT NULL,
+                requested_contracts      INTEGER,
+                filled_contracts         INTEGER,
+                ask_price                REAL,
+                mid_price                REAL,
+                estimated_cost           REAL,
+                actual_cost              REAL,
+                status                   TEXT,
+                reason                   TEXT,
+                stale_cancelled          INTEGER,
+                logged_at                TEXT NOT NULL
             );
         """)
         # Migrate existing databases that predate the new columns
@@ -130,6 +238,7 @@ class Store:
                 self._conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type}")
 
         run_cols = {
+            "cycle_id":               "TEXT",
             "sigma_short":           "REAL",
             "sigma_long":            "REAL",
             "iv_rv_ratio":           "REAL",  # cycle IV/RV ratio from market prices
@@ -312,17 +421,109 @@ class Store:
         dry_run: bool,
         iv_rv_ratio: Optional[float] = None,
         adaptive_safety_margin: Optional[float] = None,
+        cycle_id: Optional[str] = None,
     ) -> None:
         self._conn.execute("""
             INSERT INTO runs
-              (run_at, btc_price, sigma_short, sigma_long,
+              (run_at, cycle_id, btc_price, sigma_short, sigma_long,
                markets_scanned, signals_found, orders_placed, dry_run,
                iv_rv_ratio, adaptive_safety_margin)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            _now_iso(), btc_price, sigma_short, sigma_long,
+            _now_iso(), cycle_id, btc_price, sigma_short, sigma_long,
             markets_scanned, signals_found, orders_placed, int(dry_run),
             iv_rv_ratio, adaptive_safety_margin,
+        ))
+        self._conn.commit()
+
+    def log_asset_run(self, cycle_id: str, asset: AssetSnapshot) -> None:
+        self._conn.execute("""
+            INSERT OR REPLACE INTO asset_runs
+              (cycle_id, run_at, symbol, series_ticker, spot, sigma_short, sigma_long,
+               sigma_adjusted, mu, iv_rv_ratio, adaptive_margin,
+               spot_fetched_at, spot_freshness_sec, spot_status,
+               markets_fetched_at, markets_freshness_sec, markets_status,
+               iv_fetched_at, iv_freshness_sec, iv_status,
+               degraded, health_status, open_positions)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            cycle_id, _now_iso(), asset.symbol, asset.series_ticker, asset.spot,
+            asset.sigma_short, asset.sigma_long, asset.sigma_adjusted, asset.mu,
+            asset.iv_rv_ratio, asset.adaptive_margin,
+            asset.spot_source.fetched_at, asset.spot_source.freshness_sec, asset.spot_source.status,
+            asset.markets_source.fetched_at, asset.markets_source.freshness_sec, asset.markets_source.status,
+            asset.iv_source.fetched_at, asset.iv_source.freshness_sec, asset.iv_source.status,
+            int(asset.degraded), asset.health_status, asset.open_positions,
+        ))
+        self._conn.commit()
+
+    def log_market_snapshot(self, cycle_id: str, feature: MarketFeature) -> None:
+        self._conn.execute("""
+            INSERT OR REPLACE INTO market_snapshots
+              (cycle_id, symbol, ticker, close_time, expiry_bucket, strike, side,
+               contract_theo_prob, yes_theo_prob, ask, bid, mid, yes_bid, yes_ask,
+               no_bid, no_ask, spread_abs, spread_pct, gross_edge, edge, fee,
+               hours_to_expiry, distance_from_spot_sigma, last_price_divergence,
+               chain_break_ratio, chain_ok, enough_sane_strikes, spread_ok, last_price_ok)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            cycle_id, feature.symbol, feature.ticker, feature.close_time, feature.expiry_bucket,
+            feature.strike, feature.side, feature.contract_theo_prob, feature.yes_theo_prob,
+            feature.ask, feature.bid, feature.mid, feature.yes_bid, feature.yes_ask,
+            feature.no_bid, feature.no_ask, feature.spread_abs, feature.spread_pct,
+            feature.gross_edge, feature.edge, feature.fee, feature.hours_to_expiry,
+            feature.distance_from_spot_sigma, feature.last_price_divergence,
+            feature.chain_break_ratio, int(feature.chain_ok), int(feature.enough_sane_strikes),
+            int(feature.spread_ok), int(feature.last_price_ok),
+        ))
+        self._conn.commit()
+
+    def log_signal_decision(self, cycle_id: str, decision: SignalDecision) -> None:
+        self._conn.execute("""
+            INSERT OR REPLACE INTO signal_decisions
+              (cycle_id, symbol, ticker, side, eligible, score, required_edge,
+               expected_slippage, uncertainty_penalty, reject_reason, theo_prob,
+               ask, bid, mid_price, gross_edge, edge, fee, hours_to_expiry,
+               strike, distance_from_spot_sigma, degraded, chain_break_ratio, logged_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            cycle_id, decision.symbol, decision.ticker, decision.side, int(decision.eligible),
+            decision.score, decision.required_edge, decision.expected_slippage,
+            decision.uncertainty_penalty, decision.reject_reason, decision.theo_prob,
+            decision.ask, decision.bid, decision.mid_price, decision.gross_edge, decision.edge,
+            decision.fee, decision.hours_to_expiry, decision.strike,
+            decision.distance_from_spot_sigma, int(decision.degraded),
+            decision.chain_break_ratio, _now_iso(),
+        ))
+        self._conn.commit()
+
+    def log_execution_attempt(
+        self,
+        cycle_id: str,
+        symbol: str,
+        ticker: str,
+        side: str,
+        trading_mode: str,
+        requested_contracts: int,
+        filled_contracts: int,
+        ask_price: float,
+        mid_price: float,
+        estimated_cost: float,
+        actual_cost: float,
+        status: str,
+        reason: str,
+        stale_cancelled: bool = False,
+    ) -> None:
+        self._conn.execute("""
+            INSERT INTO execution_attempts
+              (cycle_id, symbol, ticker, side, trading_mode, requested_contracts,
+               filled_contracts, ask_price, mid_price, estimated_cost, actual_cost,
+               status, reason, stale_cancelled, logged_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            cycle_id, symbol, ticker, side, trading_mode, requested_contracts,
+            filled_contracts, ask_price, mid_price, estimated_cost, actual_cost,
+            status, reason, int(stale_cancelled), _now_iso(),
         ))
         self._conn.commit()
 
@@ -349,6 +550,77 @@ class Store:
              LIMIT ?
         """, (n,)).fetchall()
         return [float(r[0]) for r in rows]
+
+    def _symbol_ticker_like(self, symbol: str) -> str:
+        return f"KX{symbol.upper()}-%"
+
+    def get_recent_edge_leaks(
+        self,
+        symbol: str,
+        n: int = 50,
+        before_iso: Optional[str] = None,
+    ) -> list[float]:
+        sql = """
+            SELECT edge - realized_edge
+              FROM orders
+             WHERE realized_edge IS NOT NULL
+               AND edge IS NOT NULL
+               AND action = 'buy'
+               AND ticker LIKE ?
+        """
+        params: list[object] = [self._symbol_ticker_like(symbol)]
+        if before_iso:
+            sql += " AND logged_at <= ?"
+            params.append(before_iso)
+        sql += " ORDER BY logged_at DESC LIMIT ?"
+        params.append(n)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [float(r[0]) for r in rows if r[0] is not None]
+
+    def get_recent_positive_slippages(
+        self,
+        symbol: str,
+        n: int = 50,
+        before_iso: Optional[str] = None,
+    ) -> list[float]:
+        sql = """
+            SELECT slippage
+              FROM orders
+             WHERE slippage IS NOT NULL
+               AND action = 'buy'
+               AND ticker LIKE ?
+        """
+        params: list[object] = [self._symbol_ticker_like(symbol)]
+        if before_iso:
+            sql += " AND logged_at <= ?"
+            params.append(before_iso)
+        sql += " ORDER BY logged_at DESC LIMIT ?"
+        params.append(n)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [max(0.0, float(r[0])) for r in rows if r[0] is not None]
+
+    def get_recent_settled_abs_errors(
+        self,
+        symbol: str,
+        n: int = 30,
+        before_iso: Optional[str] = None,
+    ) -> list[float]:
+        sql = """
+            SELECT ABS(settled_value - theo_prob)
+              FROM orders
+             WHERE settled_value IS NOT NULL
+               AND theo_prob IS NOT NULL
+               AND action = 'buy'
+               AND ticker LIKE ?
+        """
+        params: list[object] = [self._symbol_ticker_like(symbol)]
+        if before_iso:
+            sql += " AND fill_checked_at <= ?"
+            params.append(before_iso)
+        sql += " ORDER BY fill_checked_at DESC LIMIT ?"
+        params.append(n)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [float(r[0]) for r in rows if r[0] is not None]
 
     def get_prob_calibration_bias(
         self,
@@ -417,6 +689,56 @@ class Store:
             (f"{today}%",),
         ).fetchone()
         return float(row[0] or 0)
+
+    def get_todays_spend_by_symbol(self) -> dict[str, float]:
+        today = _now_iso()[:10]
+        rows = self._conn.execute("""
+            SELECT SUBSTR(ticker, 3, 3) AS symbol, SUM(cost_dollars)
+              FROM orders
+             WHERE logged_at LIKE ?
+               AND status != 'canceled'
+             GROUP BY SUBSTR(ticker, 3, 3)
+        """, (f"{today}%",)).fetchall()
+        return {str(r[0]).replace("-", ""): float(r[1] or 0.0) for r in rows}
+
+    def get_asset_runs_in_range(self, date_from: str, date_to: str, symbols: list[str]) -> list[sqlite3.Row]:
+        placeholders = ",".join("?" for _ in symbols)
+        params = [date_from, date_to, *symbols]
+        return self._conn.execute(f"""
+            SELECT * FROM asset_runs
+             WHERE substr(run_at, 1, 10) >= ?
+               AND substr(run_at, 1, 10) <= ?
+               AND symbol IN ({placeholders})
+             ORDER BY run_at ASC, symbol ASC
+        """, params).fetchall()
+
+    def get_market_snapshots_for_cycle(self, cycle_id: str, symbol: str) -> list[sqlite3.Row]:
+        return self._conn.execute("""
+            SELECT * FROM market_snapshots
+             WHERE cycle_id = ?
+               AND symbol = ?
+             ORDER BY strike ASC
+        """, (cycle_id, symbol)).fetchall()
+
+    def get_signal_decisions_for_cycle(self, cycle_id: str) -> list[sqlite3.Row]:
+        return self._conn.execute("""
+            SELECT * FROM signal_decisions
+             WHERE cycle_id = ?
+             ORDER BY score DESC, ticker ASC
+        """, (cycle_id,)).fetchall()
+
+    def get_distinct_cycle_ids_in_range(self, date_from: str, date_to: str, symbols: list[str]) -> list[str]:
+        placeholders = ",".join("?" for _ in symbols)
+        params = [date_from, date_to, *symbols]
+        rows = self._conn.execute(f"""
+            SELECT DISTINCT cycle_id
+              FROM asset_runs
+             WHERE substr(run_at, 1, 10) >= ?
+               AND substr(run_at, 1, 10) <= ?
+               AND symbol IN ({placeholders})
+             ORDER BY cycle_id ASC
+        """, params).fetchall()
+        return [str(r[0]) for r in rows]
 
     # ------------------------------------------------------------------
     # CSV append

@@ -44,6 +44,7 @@ ENABLE_ETH: bool = _bool("ENABLE_ETH", True)
 
 # --- Strategy ---
 MIN_EDGE: float = _float("MIN_EDGE", 0.15)          # was 0.08 — raised to require stronger edges
+TRADING_MODE: str = os.getenv("TRADING_MODE", "observe").strip().lower()
 USE_DRIFT: bool = _bool("USE_DRIFT", True)          # include trailing drift μ in the log-normal pricer
 DRIFT_LOOKBACK_DAYS: int = _int("DRIFT_LOOKBACK_DAYS", 30)  # window for the trailing log-return drift estimate
 MIN_T_HOURS: float = _float("MIN_T_HOURS", 1.0)     # was 0.5 — avoid noisy near-expiry markets
@@ -55,12 +56,24 @@ MIN_BID_ASK_SPREAD: float = _float("MIN_BID_ASK_SPREAD", 0.0)   # minimum accept
 MAX_BID_ASK_SPREAD: float = _float("MAX_BID_ASK_SPREAD", 0.25)  # skip markets where ask-bid > this (wide spread = phantom edge)
 MAX_BID_ASK_PCT_SPREAD: float = _float("MAX_BID_ASK_PCT_SPREAD", 0.30)  # skip if spread > 30% of mid-price (relative illiquidity filter)
 MAX_LAST_PRICE_DIVERGENCE: float = _float("MAX_LAST_PRICE_DIVERGENCE", 0.15)  # skip if last_price diverges > 0.15 from yes_mid (stale/moving market)
+THEO_PROB_BAND_MIN: float = _float("THEO_PROB_BAND_MIN", 0.15)
+THEO_PROB_BAND_MAX: float = _float("THEO_PROB_BAND_MAX", 0.85)
+MAX_SIGMA_DISTANCE: float = _float("MAX_SIGMA_DISTANCE", 1.5)
+MAX_CHAIN_BREAK_PCT: float = _float("MAX_CHAIN_BREAK_PCT", 0.10)
+EDGE_LEAK_LOOKBACK_FILLS: int = _int("EDGE_LEAK_LOOKBACK_FILLS", 50)
+EDGE_HURDLE_BUFFER: float = _float("EDGE_HURDLE_BUFFER", 0.02)
+SETTLED_MAE_LOOKBACK_TRADES: int = _int("SETTLED_MAE_LOOKBACK_TRADES", 30)
+DATA_STALE_AFTER_SEC_KRAKEN: int = _int("DATA_STALE_AFTER_SEC_KRAKEN", 20)
+DATA_STALE_AFTER_SEC_KALSHI: int = _int("DATA_STALE_AFTER_SEC_KALSHI", 20)
+DATA_STALE_AFTER_SEC_DERIBIT: int = _int("DATA_STALE_AFTER_SEC_DERIBIT", 120)
 
 # --- Risk ---
 DAILY_SPEND_PCT: float = _float("DAILY_SPEND_PCT", 0.10)      # fraction of balance allowed to spend per day
 DAILY_SPEND_FLOOR: float = _float("DAILY_SPEND_FLOOR", 5.0)   # minimum daily cap regardless of balance
 MAX_CONTRACTS_PER_MARKET: int = _int("MAX_CONTRACTS_PER_MARKET", 3)  # was 10
 MAX_POSITIONS: int = _int("MAX_POSITIONS", 2)              # was 5 — fewer correlated positions
+MAX_SYMBOL_DAILY_SPEND_PCT: float = _float("MAX_SYMBOL_DAILY_SPEND_PCT", 0.05)
+MAX_SYMBOL_POSITIONS: int = _int("MAX_SYMBOL_POSITIONS", 1)
 KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.10)    # was 0.25 — much more conservative
 MAX_DRAWDOWN_PCT: float = _float("MAX_DRAWDOWN_PCT", 0.20)  # stop trading if account drops 20% from session start
 BANKROLL_FRACTION: float = _float("BANKROLL_FRACTION", 0.25)  # never risk more than 25% of actual balance per day
