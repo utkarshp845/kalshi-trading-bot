@@ -588,7 +588,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     if not underlyings:
         _consecutive_price_feed_failures += 1
         log.error("No underlyings produced usable state this cycle")
-        if _consecutive_price_feed_failures >= 3:
+        if _consecutive_price_feed_failures == 3 or _consecutive_price_feed_failures % 10 == 0:
             alert(
                 f"All underlyings failed for {_consecutive_price_feed_failures} consecutive cycles",
                 level="ERROR",

@@ -21,6 +21,21 @@ from cryptography.hazmat.primitives.asymmetric import padding
 log = logging.getLogger(__name__)
 
 
+def _money_from_dict(d: dict, dollars_key: str, cents_key: str) -> float:
+    """
+    Read a money field from Kalshi JSON.
+
+    The API commonly exposes both `*_dollars` and raw cent-denominated integer
+    variants. Prefer the explicit dollar field when present; otherwise treat the
+    raw field as cents.
+    """
+    if d.get(dollars_key) is not None:
+        return float(d[dollars_key])
+    if d.get(cents_key) is not None:
+        return float(d[cents_key]) / 100.0
+    return 0.0
+
+
 @dataclass
 class Market:
     ticker: str
@@ -40,11 +55,15 @@ class Market:
             event_ticker=d.get("event_ticker", ""),
             status=d.get("status", ""),
             close_time=d.get("close_time", ""),
-            yes_ask=float(d.get("yes_ask_dollars") or d.get("yes_ask", 0) / 100),
-            no_ask=float(d.get("no_ask_dollars") or d.get("no_ask", 0) / 100),
-            yes_bid=float(d.get("yes_bid_dollars") or d.get("yes_bid", 0) / 100),
-            no_bid=float(d.get("no_bid_dollars") or d.get("no_bid", 0) / 100),
-            last_price=float(d["last_price_dollars"]) if d.get("last_price_dollars") is not None else None,
+            yes_ask=_money_from_dict(d, "yes_ask_dollars", "yes_ask"),
+            no_ask=_money_from_dict(d, "no_ask_dollars", "no_ask"),
+            yes_bid=_money_from_dict(d, "yes_bid_dollars", "yes_bid"),
+            no_bid=_money_from_dict(d, "no_bid_dollars", "no_bid"),
+            last_price=(
+                _money_from_dict(d, "last_price_dollars", "last_price")
+                if d.get("last_price_dollars") is not None or d.get("last_price") is not None
+                else None
+            ),
         )
 
 
@@ -72,11 +91,11 @@ class Order:
             side=d.get("side", ""),
             action=d.get("action", ""),
             status=d.get("status", ""),
-            yes_price=float(d.get("yes_price_dollars") or 0),
-            no_price=float(d.get("no_price_dollars") or 0),
+            yes_price=_money_from_dict(d, "yes_price_dollars", "yes_price"),
+            no_price=_money_from_dict(d, "no_price_dollars", "no_price"),
             count=int(float(d.get("initial_count_fp") or 0)),
             fill_count=int(float(d.get("fill_count_fp") or 0)),
-            taker_fill_cost=float(d.get("taker_fill_cost_dollars") or 0),
+            taker_fill_cost=_money_from_dict(d, "taker_fill_cost_dollars", "taker_fill_cost"),
             created_time=d.get("created_time", ""),
         )
 
@@ -179,7 +198,11 @@ class KalshiClient:
         """Return available balance in USD."""
         path = "/portfolio/balance"
         data = self._get(path)
-        balance = float(data.get("balance", data.get("available_balance", 0)))
+        balance = (
+            _money_from_dict(data, "balance_dollars", "balance")
+            if data.get("balance_dollars") is not None or data.get("balance") is not None
+            else _money_from_dict(data, "available_balance_dollars", "available_balance")
+        )
         log.debug("Account balance: %.2f", balance)
         return balance
 
@@ -196,14 +219,14 @@ class KalshiClient:
                     ticker=p["ticker"],
                     side="yes",
                     quantity=qty_yes,
-                    cost=float(p.get("cost_basis_yes_dollars", 0)),
+                    cost=_money_from_dict(p, "cost_basis_yes_dollars", "cost_basis_yes"),
                 ))
             if qty_no > 0:
                 positions.append(Position(
                     ticker=p["ticker"],
                     side="no",
                     quantity=qty_no,
-                    cost=float(p.get("cost_basis_no_dollars", 0)),
+                    cost=_money_from_dict(p, "cost_basis_no_dollars", "cost_basis_no"),
                 ))
         log.debug("Open positions: %d", len(positions))
         return positions

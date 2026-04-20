@@ -106,6 +106,8 @@ DRAWDOWN_TIER_2_SCALE: float = _float("DRAWDOWN_TIER_2_SCALE", 0.25)  # scale si
 
 # --- Monitoring ---
 ALERT_WEBHOOK_URL: str = os.getenv("ALERT_WEBHOOK_URL", "")  # Slack/Discord webhook; empty = log only
+ALERT_WEBHOOK_MIN_LEVEL: str = os.getenv("ALERT_WEBHOOK_MIN_LEVEL", "WARNING").upper()
+ALERT_DEDUP_SECONDS: int = _int("ALERT_DEDUP_SECONDS", 900)
 
 # --- Execution ---
 POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 120)  # was 300 — react faster to opportunities
