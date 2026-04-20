@@ -22,12 +22,12 @@ def _required_edge(store, symbol: str, before_iso: Optional[str] = None) -> floa
 
 def _expected_slippage(store, symbol: str, before_iso: Optional[str] = None) -> float:
     slippages = store.get_recent_positive_slippages(symbol, cfg.EDGE_LEAK_LOOKBACK_FILLS, before_iso=before_iso)
-    return _p75(slippages) if slippages else 0.01
+    return _p75(slippages) if slippages else cfg.DEFAULT_EXPECTED_SLIPPAGE
 
 
 def _uncertainty_penalty(store, symbol: str, before_iso: Optional[str] = None) -> float:
     errors = store.get_recent_settled_abs_errors(symbol, cfg.SETTLED_MAE_LOOKBACK_TRADES, before_iso=before_iso)
-    return max(0.01, sum(errors) / len(errors)) if errors else 0.01
+    return max(0.01, sum(errors) / len(errors)) if errors else cfg.DEFAULT_UNCERTAINTY_PENALTY
 
 
 def decide_signal(
@@ -36,15 +36,63 @@ def decide_signal(
     feature: MarketFeature,
     held_tickers: set[str],
     before_iso: Optional[str] = None,
+    trading_mode: str = "observe",
 ) -> SignalDecision:
     required_edge = _required_edge(store, asset.symbol, before_iso=before_iso)
     expected_slippage = _expected_slippage(store, asset.symbol, before_iso=before_iso)
     uncertainty_penalty = _uncertainty_penalty(store, asset.symbol, before_iso=before_iso)
+    recent_realized_edges = store.get_recent_realized_edges(
+        asset.symbol,
+        cfg.LIVE_GUARD_LOOKBACK_FILLS,
+        before_iso=before_iso,
+    )
+    recent_settled_errors = store.get_recent_settled_abs_errors(
+        asset.symbol,
+        cfg.LIVE_GUARD_LOOKBACK_SETTLED,
+        before_iso=before_iso,
+    )
+    avg_recent_realized = (
+        sum(recent_realized_edges) / len(recent_realized_edges)
+        if recent_realized_edges else None
+    )
+    avg_recent_error = (
+        sum(recent_settled_errors) / len(recent_settled_errors)
+        if recent_settled_errors else None
+    )
+
+    if trading_mode == "live":
+        required_edge = max(required_edge, cfg.LIVE_MIN_REQUIRED_EDGE)
+        if (
+            len(recent_realized_edges) < cfg.LIVE_MIN_FILL_HISTORY
+            or len(recent_settled_errors) < cfg.LIVE_MIN_SETTLED_HISTORY
+        ):
+            required_edge = max(required_edge, cfg.COLD_START_MIN_EDGE)
+
     score = feature.edge - expected_slippage - uncertainty_penalty
 
     reject_reason = ""
     if not asset.tradeable:
         reject_reason = asset.health_status
+    elif (
+        trading_mode == "live"
+        and asset.degraded
+        and cfg.LIVE_SKIP_DEGRADED_ASSETS
+    ):
+        reject_reason = "degraded_asset"
+    elif (
+        trading_mode == "live"
+        and len(recent_realized_edges) >= cfg.LIVE_MIN_FILL_HISTORY
+        and avg_recent_realized is not None
+        and avg_recent_realized <= cfg.LIVE_HALT_MAX_AVG_REALIZED_EDGE
+    ):
+        reject_reason = "negative_recent_realized_edge"
+    elif (
+        trading_mode == "live"
+        and len(recent_settled_errors) >= cfg.LIVE_MIN_SETTLED_HISTORY
+        and avg_recent_error is not None
+        and avg_recent_error > cfg.LIVE_HALT_MAX_SETTLED_MAE
+    ):
+        reject_reason = "high_recent_model_error"
     elif feature.ticker in held_tickers:
         reject_reason = "already_held"
     elif feature.hours_to_expiry < cfg.MIN_T_HOURS:

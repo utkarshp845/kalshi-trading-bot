@@ -599,6 +599,28 @@ class Store:
         rows = self._conn.execute(sql, params).fetchall()
         return [max(0.0, float(r[0])) for r in rows if r[0] is not None]
 
+    def get_recent_realized_edges(
+        self,
+        symbol: str,
+        n: int = 50,
+        before_iso: Optional[str] = None,
+    ) -> list[float]:
+        sql = """
+            SELECT realized_edge
+              FROM orders
+             WHERE realized_edge IS NOT NULL
+               AND action = 'buy'
+               AND ticker LIKE ?
+        """
+        params: list[object] = [self._symbol_ticker_like(symbol)]
+        if before_iso:
+            sql += " AND fill_checked_at <= ?"
+            params.append(before_iso)
+        sql += " ORDER BY fill_checked_at DESC LIMIT ?"
+        params.append(n)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [float(r[0]) for r in rows if r[0] is not None]
+
     def get_recent_settled_abs_errors(
         self,
         symbol: str,

@@ -768,7 +768,14 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     reject_counts: Counter[str] = Counter()
     for symbol, asset in assets.items():
         for feature in features_by_symbol.get(symbol, []):
-            decision = decide_signal(store, asset, feature, held_tickers, before_iso=cycle_id)
+            decision = decide_signal(
+                store,
+                asset,
+                feature,
+                held_tickers,
+                before_iso=cycle_id,
+                trading_mode=trading_mode,
+            )
             store.log_signal_decision(cycle_id, decision)
             all_decisions.append(decision)
             if not decision.eligible:

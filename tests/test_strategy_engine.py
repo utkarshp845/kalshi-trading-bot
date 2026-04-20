@@ -4,16 +4,20 @@ from bot.strategy_engine import decide_signal
 
 
 class _Store:
-    def __init__(self, edge_leaks=None, slippages=None, errors=None):
+    def __init__(self, edge_leaks=None, slippages=None, errors=None, realized_edges=None):
         self.edge_leaks = edge_leaks or []
         self.slippages = slippages or []
         self.errors = errors or []
+        self.realized_edges = realized_edges or []
 
     def get_recent_edge_leaks(self, symbol, n, before_iso=None):
         return self.edge_leaks[:n]
 
     def get_recent_positive_slippages(self, symbol, n, before_iso=None):
         return self.slippages[:n]
+
+    def get_recent_realized_edges(self, symbol, n, before_iso=None):
+        return self.realized_edges[:n]
 
     def get_recent_settled_abs_errors(self, symbol, n, before_iso=None):
         return self.errors[:n]
@@ -102,3 +106,40 @@ def test_decision_uses_uncertainty_penalty_in_score():
     decision = decide_signal(store, _asset(), _feature(edge=0.20), held_tickers=set())
     assert decision.score < 0
     assert decision.reject_reason == "score_non_positive"
+
+
+def test_live_mode_requires_higher_cold_start_edge():
+    decision = decide_signal(_Store(), _asset(), _feature(edge=0.26), held_tickers=set(), trading_mode="live")
+    assert decision.eligible is False
+    assert decision.reject_reason == "edge_below_hurdle"
+    assert decision.required_edge >= 0.30
+
+
+def test_live_mode_rejects_negative_recent_realized_edge():
+    store = _Store(realized_edges=[-0.05] * 20, errors=[0.05] * 20)
+    decision = decide_signal(store, _asset(), _feature(edge=0.40), held_tickers=set(), trading_mode="live")
+    assert decision.eligible is False
+    assert decision.reject_reason == "negative_recent_realized_edge"
+
+
+def test_live_mode_rejects_degraded_asset():
+    asset = _asset()
+    asset = AssetSnapshot(
+        symbol=asset.symbol,
+        series_ticker=asset.series_ticker,
+        spot=asset.spot,
+        sigma_short=asset.sigma_short,
+        sigma_long=asset.sigma_long,
+        sigma_adjusted=asset.sigma_adjusted,
+        mu=asset.mu,
+        iv_rv_ratio=asset.iv_rv_ratio,
+        adaptive_margin=asset.adaptive_margin,
+        spot_source=asset.spot_source,
+        markets_source=asset.markets_source,
+        iv_source=asset.iv_source,
+        degraded=True,
+        health_status=asset.health_status,
+    )
+    decision = decide_signal(_Store(), asset, _feature(edge=0.40), held_tickers=set(), trading_mode="live")
+    assert decision.eligible is False
+    assert decision.reject_reason == "degraded_asset"
