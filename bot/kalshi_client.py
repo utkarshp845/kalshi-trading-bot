@@ -6,6 +6,8 @@ Every request is signed with:
   KALSHI-ACCESS-TIMESTAMP: Unix timestamp in milliseconds (string)
   KALSHI-ACCESS-SIGNATURE: base64(RSA-PSS-SHA256(timestamp_ms + METHOD + /path))
 """
+from __future__ import annotations
+
 import base64
 import logging
 import time
@@ -310,7 +312,7 @@ class KalshiClient:
             if data.get("balance_dollars") is not None or data.get("balance") is not None
             else _money_from_dict(data, "available_balance_dollars", "available_balance")
         )
-        log.debug("Account balance: %.2f", balance)
+        log.debug("Account balance: $%.2f", balance)
         return balance
 
     def get_positions(self) -> list[Position]:

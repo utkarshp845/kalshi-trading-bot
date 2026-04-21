@@ -129,17 +129,21 @@ def run(dry_run: bool) -> None:
     )
     log.info(
         "Config: min_edge=%.2f  min_t_hours=%.1f  daily_spend=%.0f%%/floor=$%.0f  "
-        "max_positions=%d  kelly=%.2f  vol_margin=%.2f  max_vol_ratio=%.1f  "
+        "max_positions=%d  max_contracts=%d  kelly=%.2f  corr_discount=%.2f  "
+        "vol_margin=%.2f  iv_margin=[%.2f,%.2f]  max_vol_ratio=%.1f  "
         "max_spread=%.2f  drawdown_limit=%.0f%%  bankroll_frac=%.0f%%  "
         "exit=%s  take_profit=%.1fx  drift=%s  deribit_iv=%s(w=%.2f)  "
-        "price_improvement=%s  poll=%ds",
+        "maker=%s(%ds)  price_improvement=%s(%ds)  poll=%ds",
         cfg.MIN_EDGE, cfg.MIN_T_HOURS, cfg.DAILY_SPEND_PCT * 100, cfg.DAILY_SPEND_FLOOR,
-        cfg.MAX_POSITIONS, cfg.KELLY_FRACTION, cfg.VOL_SAFETY_MARGIN,
+        cfg.MAX_POSITIONS, cfg.MAX_CONTRACTS_PER_MARKET,
+        cfg.KELLY_FRACTION, cfg.CORRELATION_DISCOUNT_FACTOR,
+        cfg.VOL_SAFETY_MARGIN, cfg.IV_SAFETY_MARGIN_MIN, cfg.IV_SAFETY_MARGIN_MAX,
         cfg.MAX_VOL_RATIO, cfg.MAX_BID_ASK_SPREAD,
         cfg.MAX_DRAWDOWN_PCT * 100, cfg.BANKROLL_FRACTION * 100,
         cfg.ENABLE_POSITION_EXIT, cfg.TAKE_PROFIT_TRIGGER, cfg.USE_DRIFT,
         cfg.ENABLE_DERIBIT_IV, cfg.DERIBIT_IV_WEIGHT,
-        cfg.ENABLE_PRICE_IMPROVEMENT,
+        cfg.ENABLE_MAKER_ORDERS, cfg.MAKER_ORDER_TIMEOUT_SEC,
+        cfg.ENABLE_PRICE_IMPROVEMENT, cfg.PRICE_IMPROVEMENT_TIMEOUT_SEC,
         cfg.POLL_INTERVAL_SECONDS,
     )
 
@@ -170,6 +174,7 @@ def run(dry_run: bool) -> None:
         drawdown_tier_1_scale=cfg.DRAWDOWN_TIER_1_SCALE,
         drawdown_tier_2_pct=cfg.DRAWDOWN_TIER_2_PCT,
         drawdown_tier_2_scale=cfg.DRAWDOWN_TIER_2_SCALE,
+        correlation_discount_factor=cfg.CORRELATION_DISCOUNT_FACTOR,
     )
 
     store = Store(db_path=cfg.DB_PATH, trades_csv_path=cfg.TRADES_CSV)
@@ -548,12 +553,14 @@ def _execute_with_price_improvement(
     contracts: int,
     ask_price: float,
     mid_price: float,
-    dry_run: bool,
+    bid_price: float = 0.0,
+    dry_run: bool = False,
     symbol: str = "BTC",
 ) -> list[Order]:
     """
-    Maker-first entry: post at the best non-crossing price and cancel rather
-    than pay the ask into a thin book.
+    Maker-first entry: post at the live market bid with post_only=True and
+    cancel rather than cross the book. Uses MAKER_ENTRY_TIMEOUT_SEC to wait
+    for a passive fill before giving up.
     """
     passive_price = max(0.01, min(0.99, mid_price if mid_price < ask_price else ask_price - 0.01))
     if passive_price <= 0:
@@ -630,7 +637,10 @@ def _execute_with_price_improvement(
     filled = order1.fill_count
     kalshi.cancel_order(order1.order_id)
     if spot_moved or book_deteriorated:
-        log.info("Maker-first entry canceled for %s: spot_moved=%s book_deteriorated=%s", ticker, spot_moved, book_deteriorated)
+        log.info(
+            "Maker-first entry canceled for %s: spot_moved=%s book_deteriorated=%s",
+            ticker, spot_moved, book_deteriorated,
+        )
     return [order1] if filled > 0 else []
 
 
@@ -801,12 +811,19 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         log.info("Empirical slippage factor: %.2f", slippage_factor)
 
     # --- Drawdown guard ---
+    already_halted = risk.drawdown_halted
     if risk.check_drawdown(balance):
         log.warning("Drawdown limit reached — halting all trading for today")
-        alert(
-            f"Drawdown halt: balance=${balance:.2f} exceeded {cfg.MAX_DRAWDOWN_PCT:.0%} limit",
-            level="WARNING",
-        )
+        if not already_halted:
+            session_start = risk.session_start_balance
+            actual_dd = (1.0 - balance / session_start) * 100 if session_start > 0 else 0.0
+            alert(
+                f"Trading halted: balance dropped to ${balance:,.2f} "
+                f"({actual_dd:.1f}% below session start of ${session_start:,.2f}), "
+                f"exceeding the {cfg.MAX_DRAWDOWN_PCT:.0%} drawdown limit. "
+                f"No new trades until tomorrow.",
+                level="WARNING",
+            )
         store.snapshot_daily(balance, risk.daily_spent, len(positions))
         # Log the runs row using BTC's stats if available, else first underlying.
         primary = assets.get("BTC") or next(iter(assets.values()))
@@ -957,6 +974,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 contracts=contracts,
                 ask_price=decision.ask,
                 mid_price=decision.mid_price,
+                bid_price=getattr(decision, "bid_price", 0.0),
                 dry_run=False,
                 symbol=decision.symbol,
             )

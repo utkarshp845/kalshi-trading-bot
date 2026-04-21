@@ -64,8 +64,10 @@ def _fast_price_improvement(monkeypatch):
     """Don't actually sleep or hit the network during tests."""
     monkeypatch.setattr(main_mod.time, "sleep", lambda _s: None)
     monkeypatch.setattr(main_mod, "get_spot_price", lambda symbol="BTC": 95000.0)
+    monkeypatch.setattr(cfg, "ENABLE_MAKER_ORDERS", False)   # tested separately
     monkeypatch.setattr(cfg, "ENABLE_PRICE_IMPROVEMENT", True)
     monkeypatch.setattr(cfg, "PRICE_IMPROVEMENT_TIMEOUT_SEC", 0)
+    monkeypatch.setattr(cfg, "MAKER_ORDER_TIMEOUT_SEC", 0)
     monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 10)
     monkeypatch.setattr(cfg, "STALE_ORDER_SPOT_MOVE_PCT", 0.003)
 
@@ -77,7 +79,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 1
@@ -95,7 +97,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 1
@@ -126,7 +128,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 1
@@ -150,7 +152,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         # Passive order cancelled, no taker-style fallback placed → no fills returned
@@ -175,7 +177,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 1
@@ -188,7 +190,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.45, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.45, bid_price=0.41, dry_run=False,
         )
 
         assert len(orders) == 1
