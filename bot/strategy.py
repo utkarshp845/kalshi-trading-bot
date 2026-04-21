@@ -33,6 +33,7 @@ class Signal:
     theo_prob: float
     strike: float
     mid_price: float = 0.0      # bid-ask midpoint for price-improvement orders
+    bid_price: float = 0.0      # best bid — used for maker orders ($0 fee)
     hours_to_expiry: float = 0.0
 
 
@@ -151,6 +152,7 @@ def evaluate(
 
     ask_price = market.yes_ask if best_side == "yes" else market.no_ask
     mid = yes_mid if best_side == "yes" else no_mid
+    bid = market.yes_bid if best_side == "yes" else market.no_bid
 
     return Signal(
         ticker=market.ticker,
@@ -162,6 +164,7 @@ def evaluate(
         theo_prob=theo_prob,
         strike=strike,
         mid_price=mid,
+        bid_price=bid,
         hours_to_expiry=T_hours,
     ), ""
 

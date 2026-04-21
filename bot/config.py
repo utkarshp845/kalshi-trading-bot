@@ -43,32 +43,33 @@ ENABLE_BTC: bool = _bool("ENABLE_BTC", True)
 ENABLE_ETH: bool = _bool("ENABLE_ETH", True)
 
 # --- Strategy ---
-MIN_EDGE: float = _float("MIN_EDGE", 0.15)          # was 0.08 — raised to require stronger edges
-USE_DRIFT: bool = _bool("USE_DRIFT", True)          # include trailing drift μ in the log-normal pricer
+MIN_EDGE: float = _float("MIN_EDGE", 0.05)          # net edge required after fees; 0.05 is realistic for liquid BTC markets
+USE_DRIFT: bool = _bool("USE_DRIFT", False)         # 30-day trailing drift is too noisy to be reliable signal; disabled by default
 DRIFT_LOOKBACK_DAYS: int = _int("DRIFT_LOOKBACK_DAYS", 30)  # window for the trailing log-return drift estimate
 MIN_T_HOURS: float = _float("MIN_T_HOURS", 1.0)     # was 0.5 — avoid noisy near-expiry markets
 VOL_SHORT_DAYS: int = _int("VOL_SHORT_DAYS", 7)      # fast vol: used for signal probability
 VOL_LONG_DAYS: int = _int("VOL_LONG_DAYS", 30)       # slow vol: logged as regime reference
-VOL_SAFETY_MARGIN: float = _float("VOL_SAFETY_MARGIN", 1.25)  # inflate vol estimate by 25% to account for implied > realized
-MAX_VOL_RATIO: float = _float("MAX_VOL_RATIO", 1.8)  # skip trading when short/long vol ratio exceeds this (unstable regime)
+VOL_SAFETY_MARGIN: float = _float("VOL_SAFETY_MARGIN", 1.05)  # was 1.25 — slight inflation only; over-inflating hides real edge
+MAX_VOL_RATIO: float = _float("MAX_VOL_RATIO", 2.5)  # was 1.8 — volatile regimes have the most mispricing; raised ceiling
 MIN_BID_ASK_SPREAD: float = _float("MIN_BID_ASK_SPREAD", 0.0)   # minimum acceptable bid (liquidity filter)
 MAX_BID_ASK_SPREAD: float = _float("MAX_BID_ASK_SPREAD", 0.25)  # skip markets where ask-bid > this (wide spread = phantom edge)
 MAX_BID_ASK_PCT_SPREAD: float = _float("MAX_BID_ASK_PCT_SPREAD", 0.30)  # skip if spread > 30% of mid-price (relative illiquidity filter)
 MAX_LAST_PRICE_DIVERGENCE: float = _float("MAX_LAST_PRICE_DIVERGENCE", 0.15)  # skip if last_price diverges > 0.15 from yes_mid (stale/moving market)
 
 # --- Risk ---
-DAILY_SPEND_PCT: float = _float("DAILY_SPEND_PCT", 0.10)      # fraction of balance allowed to spend per day
+DAILY_SPEND_PCT: float = _float("DAILY_SPEND_PCT", 0.15)      # was 0.10 — 15% of balance per day
 DAILY_SPEND_FLOOR: float = _float("DAILY_SPEND_FLOOR", 5.0)   # minimum daily cap regardless of balance
-MAX_CONTRACTS_PER_MARKET: int = _int("MAX_CONTRACTS_PER_MARKET", 3)  # was 10
-MAX_POSITIONS: int = _int("MAX_POSITIONS", 2)              # was 5 — fewer correlated positions
-KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.10)    # was 0.25 — much more conservative
+MAX_CONTRACTS_PER_MARKET: int = _int("MAX_CONTRACTS_PER_MARKET", 15)  # was 3 — 3 contracts = $3 max payout, too small
+MAX_POSITIONS: int = _int("MAX_POSITIONS", 5)              # was 2 — allows more diversification across strikes
+KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.20)    # was 0.10 — stacked discounts reduced to near-zero; raised
 MAX_DRAWDOWN_PCT: float = _float("MAX_DRAWDOWN_PCT", 0.20)  # stop trading if account drops 20% from session start
-BANKROLL_FRACTION: float = _float("BANKROLL_FRACTION", 0.25)  # never risk more than 25% of actual balance per day
+BANKROLL_FRACTION: float = _float("BANKROLL_FRACTION", 0.40)  # was 0.25 — allow more of balance to be deployed
+CORRELATION_DISCOUNT_FACTOR: float = _float("CORRELATION_DISCOUNT_FACTOR", 0.85)  # was hardcoded 0.70 — 0.70^n was too aggressive
 
 # --- Implied Vol Calibration ---
 IV_CALIBRATION_MIN_OBS: int = _int("IV_CALIBRATION_MIN_OBS", 10)     # min cycles before using adaptive margin
-IV_SAFETY_MARGIN_MIN: float = _float("IV_SAFETY_MARGIN_MIN", 1.05)   # clamp adaptive margin to this floor
-IV_SAFETY_MARGIN_MAX: float = _float("IV_SAFETY_MARGIN_MAX", 3.0)    # clamp adaptive margin to this ceiling
+IV_SAFETY_MARGIN_MIN: float = _float("IV_SAFETY_MARGIN_MIN", 1.00)   # was 1.05 — allow margin to reach 1.0 when well-calibrated
+IV_SAFETY_MARGIN_MAX: float = _float("IV_SAFETY_MARGIN_MAX", 1.80)   # was 3.0 — 3x vol turns every market into 50/50; capped at 1.8
 
 # --- Deribit IV blend ---
 # When enabled, the cycle pulls live ATM IV from Deribit's public option chain
@@ -86,11 +87,13 @@ TAKE_PROFIT_TRIGGER: float = _float("TAKE_PROFIT_TRIGGER", 2.0)  # exit when the
 TAKE_PROFIT_MIN_HOURS: float = _float("TAKE_PROFIT_MIN_HOURS", 0.5)  # only take profit if there are still ≥ this many hours of decay risk left
 
 # --- Smart Order Placement ---
+ENABLE_MAKER_ORDERS: bool = _bool("ENABLE_MAKER_ORDERS", True)          # post at bid first (maker, $0 fee) before trying mid/ask
+MAKER_ORDER_TIMEOUT_SEC: int = _int("MAKER_ORDER_TIMEOUT_SEC", 120)     # seconds to wait for a maker-bid fill
 ENABLE_PRICE_IMPROVEMENT: bool = _bool("ENABLE_PRICE_IMPROVEMENT", True)
-PRICE_IMPROVEMENT_TIMEOUT_SEC: int = _int("PRICE_IMPROVEMENT_TIMEOUT_SEC", 45)  # wait this long for mid-price fill
-# Stale order monitoring: during the mid-price wait, poll BTC spot; cancel if it drifts past this threshold
+PRICE_IMPROVEMENT_TIMEOUT_SEC: int = _int("PRICE_IMPROVEMENT_TIMEOUT_SEC", 90)  # was 45 — more time at mid before falling back
+# Stale order monitoring: during waits, poll underlying spot; cancel if it drifts past this threshold
 STALE_ORDER_POLL_SEC: int = _int("STALE_ORDER_POLL_SEC", 10)
-STALE_ORDER_SPOT_MOVE_PCT: float = _float("STALE_ORDER_SPOT_MOVE_PCT", 0.003)  # 0.3% BTC move invalidates the mid quote
+STALE_ORDER_SPOT_MOVE_PCT: float = _float("STALE_ORDER_SPOT_MOVE_PCT", 0.003)  # 0.3% BTC move invalidates the quote
 
 # --- Slippage-Adjusted Sizing ---
 # Scale Kelly bet size by empirical avg(realized_edge) / avg(predicted_edge) from recent fills
@@ -108,7 +111,7 @@ DRAWDOWN_TIER_2_SCALE: float = _float("DRAWDOWN_TIER_2_SCALE", 0.25)  # scale si
 ALERT_WEBHOOK_URL: str = os.getenv("ALERT_WEBHOOK_URL", "")  # Slack/Discord webhook; empty = log only
 
 # --- Execution ---
-POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 120)  # was 300 — react faster to opportunities
+POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 60)   # was 120 — faster reaction to mispricings
 DRY_RUN: bool = _bool("DRY_RUN", False)
 FORCE_TRADING_HOURS: bool = _bool("FORCE_TRADING_HOURS", False)
 

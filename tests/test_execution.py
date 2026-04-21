@@ -52,8 +52,10 @@ def _fast_price_improvement(monkeypatch):
     """Don't actually sleep or hit the network during tests."""
     monkeypatch.setattr(main_mod.time, "sleep", lambda _s: None)
     monkeypatch.setattr(main_mod, "get_spot_price", lambda symbol="BTC": 95000.0)
+    monkeypatch.setattr(cfg, "ENABLE_MAKER_ORDERS", False)   # tested separately
     monkeypatch.setattr(cfg, "ENABLE_PRICE_IMPROVEMENT", True)
     monkeypatch.setattr(cfg, "PRICE_IMPROVEMENT_TIMEOUT_SEC", 0)
+    monkeypatch.setattr(cfg, "MAKER_ORDER_TIMEOUT_SEC", 0)
     monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 10)
     monkeypatch.setattr(cfg, "STALE_ORDER_SPOT_MOVE_PCT", 0.003)
 
@@ -65,7 +67,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 1
@@ -84,7 +86,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 2
@@ -108,7 +110,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 1
@@ -123,7 +125,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 1
@@ -147,7 +149,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         # Mid order cancelled, no ask fallback placed → no fills returned
@@ -174,7 +176,7 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
         )
 
         assert len(orders) == 2
@@ -187,8 +189,51 @@ class TestExecuteWithPriceImprovement:
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.45, dry_run=False,
+            contracts=10, ask_price=0.45, mid_price=0.45, bid_price=0.41, dry_run=False,
         )
 
         assert len(orders) == 1
         assert kalshi.place_calls == [("KXBTC-26APR4PM-B95000", "yes", 10, 0.45)]
+
+
+class TestMakerBidPhase:
+    """Tests for the Phase 0 maker-bid logic."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_maker(self, monkeypatch):
+        monkeypatch.setattr(cfg, "ENABLE_MAKER_ORDERS", True)
+        monkeypatch.setattr(cfg, "MAKER_ORDER_TIMEOUT_SEC", 0)
+
+    def test_full_maker_fill_no_further_phases(self):
+        full = _order("o1", count=10, fill_count=10, fill_cost=3.90, price=0.39)
+        kalshi = FakeKalshi(place_results=[full], get_results={"o1": full})
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
+        )
+
+        assert len(orders) == 1
+        assert orders[0].order_id == "o1"
+        assert orders[0].taker_fill_cost == pytest.approx(3.90)
+        # Only one order placed (the maker bid); no mid or ask needed
+        assert len(kalshi.place_calls) == 1
+        assert kalshi.place_calls[0][3] == 0.39  # bid price
+
+    def test_maker_unfilled_escalates_to_mid(self):
+        maker_none = _order("o1", count=10, fill_count=0, fill_cost=0.0, price=0.39)
+        mid_full = _order("o2", count=10, fill_count=10, fill_cost=4.20, price=0.42)
+        kalshi = FakeKalshi(
+            place_results=[maker_none, mid_full],
+            get_results={"o1": maker_none, "o2": mid_full},
+        )
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=10, ask_price=0.45, mid_price=0.42, bid_price=0.39, dry_run=False,
+        )
+
+        assert len(orders) == 1
+        assert orders[0].order_id == "o2"
+        assert kalshi.cancels == ["o1"]  # maker order cancelled
+        assert kalshi.place_calls[1][3] == 0.42  # mid price used next

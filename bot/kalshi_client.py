@@ -179,8 +179,9 @@ class KalshiClient:
         """Return available balance in USD."""
         path = "/portfolio/balance"
         data = self._get(path)
-        balance = float(data.get("balance", data.get("available_balance", 0)))
-        log.debug("Account balance: %.2f", balance)
+        balance_cents = float(data.get("balance", data.get("available_balance", 0)))
+        balance = balance_cents / 100.0
+        log.debug("Account balance: $%.2f (raw cents: %.0f)", balance, balance_cents)
         return balance
 
     def get_positions(self) -> list[Position]:

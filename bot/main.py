@@ -122,17 +122,21 @@ def run(dry_run: bool) -> None:
     )
     log.info(
         "Config: min_edge=%.2f  min_t_hours=%.1f  daily_spend=%.0f%%/floor=$%.0f  "
-        "max_positions=%d  kelly=%.2f  vol_margin=%.2f  max_vol_ratio=%.1f  "
+        "max_positions=%d  max_contracts=%d  kelly=%.2f  corr_discount=%.2f  "
+        "vol_margin=%.2f  iv_margin=[%.2f,%.2f]  max_vol_ratio=%.1f  "
         "max_spread=%.2f  drawdown_limit=%.0f%%  bankroll_frac=%.0f%%  "
         "exit=%s  take_profit=%.1fx  drift=%s  deribit_iv=%s(w=%.2f)  "
-        "price_improvement=%s  poll=%ds",
+        "maker=%s(%ds)  price_improvement=%s(%ds)  poll=%ds",
         cfg.MIN_EDGE, cfg.MIN_T_HOURS, cfg.DAILY_SPEND_PCT * 100, cfg.DAILY_SPEND_FLOOR,
-        cfg.MAX_POSITIONS, cfg.KELLY_FRACTION, cfg.VOL_SAFETY_MARGIN,
+        cfg.MAX_POSITIONS, cfg.MAX_CONTRACTS_PER_MARKET,
+        cfg.KELLY_FRACTION, cfg.CORRELATION_DISCOUNT_FACTOR,
+        cfg.VOL_SAFETY_MARGIN, cfg.IV_SAFETY_MARGIN_MIN, cfg.IV_SAFETY_MARGIN_MAX,
         cfg.MAX_VOL_RATIO, cfg.MAX_BID_ASK_SPREAD,
         cfg.MAX_DRAWDOWN_PCT * 100, cfg.BANKROLL_FRACTION * 100,
         cfg.ENABLE_POSITION_EXIT, cfg.TAKE_PROFIT_TRIGGER, cfg.USE_DRIFT,
         cfg.ENABLE_DERIBIT_IV, cfg.DERIBIT_IV_WEIGHT,
-        cfg.ENABLE_PRICE_IMPROVEMENT,
+        cfg.ENABLE_MAKER_ORDERS, cfg.MAKER_ORDER_TIMEOUT_SEC,
+        cfg.ENABLE_PRICE_IMPROVEMENT, cfg.PRICE_IMPROVEMENT_TIMEOUT_SEC,
         cfg.POLL_INTERVAL_SECONDS,
     )
 
@@ -161,6 +165,7 @@ def run(dry_run: bool) -> None:
         drawdown_tier_1_scale=cfg.DRAWDOWN_TIER_1_SCALE,
         drawdown_tier_2_pct=cfg.DRAWDOWN_TIER_2_PCT,
         drawdown_tier_2_scale=cfg.DRAWDOWN_TIER_2_SCALE,
+        correlation_discount_factor=cfg.CORRELATION_DISCOUNT_FACTOR,
     )
 
     store = Store(db_path=cfg.DB_PATH, trades_csv_path=cfg.TRADES_CSV)
@@ -213,7 +218,7 @@ def _apply_calibration(store: Store) -> None:
         log.info("Calibration: insufficient settled trades — using static VOL_SAFETY_MARGIN=%.3f", cfg.VOL_SAFETY_MARGIN)
         return
     direction = math.copysign(1.0, bias)
-    new_margin = max(1.0, min(2.5, cfg.VOL_SAFETY_MARGIN * (1.0 + 0.05 * direction)))
+    new_margin = max(1.0, min(1.5, cfg.VOL_SAFETY_MARGIN * (1.0 + 0.02 * direction)))
     log.info(
         "Calibration: prob_bias=%.4f → adjusting VOL_SAFETY_MARGIN %.3f → %.3f",
         bias, cfg.VOL_SAFETY_MARGIN, new_margin,
@@ -333,6 +338,55 @@ def _check_exits(
     return exited_tickers
 
 
+def _wait_for_fill(
+    kalshi: KalshiClient,
+    order: Order,
+    contracts: int,
+    timeout_sec: int,
+    symbol: str,
+    entry_spot: Optional[float],
+    phase_label: str,
+) -> tuple[Order, bool]:
+    """
+    Poll an open limit order until it fills, times out, or spot drifts too far.
+
+    Returns (updated_order, spot_moved).
+    """
+    poll = max(1, cfg.STALE_ORDER_POLL_SEC)
+    elapsed = 0
+    spot_moved = False
+
+    while elapsed < timeout_sec:
+        step = min(poll, timeout_sec - elapsed)
+        time.sleep(step)
+        elapsed += step
+
+        try:
+            order = kalshi.get_order(order.order_id)
+        except Exception:
+            pass
+
+        if order.fill_count >= contracts:
+            log.info("%s: fully filled %d/%d (after %ds)", phase_label, order.fill_count, contracts, elapsed)
+            return order, False
+
+        if entry_spot is not None:
+            try:
+                current_spot = get_spot_price(symbol)
+                drift = abs(current_spot - entry_spot) / entry_spot
+                if drift > cfg.STALE_ORDER_SPOT_MOVE_PCT:
+                    log.warning(
+                        "%s spot moved %.3f%% (%.0f → %.0f) during %s — cancelling",
+                        symbol, drift * 100, entry_spot, current_spot, phase_label,
+                    )
+                    spot_moved = True
+                    break
+            except Exception as e:
+                log.debug("Spot poll failed: %s", e)
+
+    return order, spot_moved
+
+
 def _execute_with_price_improvement(
     kalshi: KalshiClient,
     ticker: str,
@@ -340,116 +394,87 @@ def _execute_with_price_improvement(
     contracts: int,
     ask_price: float,
     mid_price: float,
+    bid_price: float,
     dry_run: bool,
     symbol: str = "BTC",
 ) -> list[Order]:
     """
-    Attempt to fill at the mid-price first (price improvement).
-    During the PRICE_IMPROVEMENT_TIMEOUT_SEC window, poll the underlying's spot
-    every STALE_ORDER_POLL_SEC seconds; if spot moves more than
-    STALE_ORDER_SPOT_MOVE_PCT away from the entry spot, cancel the
-    mid-price order (and skip the ask fallback) since the edge has
-    likely evaporated. Otherwise, after the timeout, cancel any
-    unfilled portion and re-fill the remainder at the ask price.
+    Three-phase fill strategy (best price → acceptable → immediate):
 
-    Returns the list of Orders that resulted in fills (may be 0, 1, or 2).
-    Callers must sum taker_fill_cost across returned orders for accurate
-    balance and risk accounting.
+    Phase 0 — Maker bid (ENABLE_MAKER_ORDERS): post at bid_price, $0 taker fee.
+               Kalshi charges maker $0; posting below ask rests in the book.
+    Phase 1 — Mid-price (ENABLE_PRICE_IMPROVEMENT): post at mid, reduced fee.
+    Phase 2 — Ask fallback: immediate taker fill at ask.
+
+    Each phase cancels any unfilled remainder before escalating.
+    If spot moves > STALE_ORDER_SPOT_MOVE_PCT during any wait, abort entirely.
+
+    Returns list of Orders with fills. Callers sum taker_fill_cost for accounting.
     """
-    if not cfg.ENABLE_PRICE_IMPROVEMENT or mid_price >= ask_price:
-        # No improvement possible — just fill at ask
-        order = kalshi.place_order(ticker, side, contracts, ask_price)
-        return [order] if order is not None else []
-
-    # Snapshot the underlying's spot at order-entry time for drift detection.
     try:
         entry_spot = get_spot_price(symbol)
     except Exception as e:
-        log.debug("Spot snapshot before mid-price order failed: %s", e)
+        log.debug("Spot snapshot failed: %s", e)
         entry_spot = None
 
-    # Phase 1: try mid-price
-    try:
-        order1 = kalshi.place_order(ticker, side, contracts, mid_price)
-        log.info("Price improvement: placed %d @ mid=%.3f (ask=%.3f)", contracts, mid_price, ask_price)
-    except Exception as e:
-        log.warning("Mid-price order failed, falling back to ask: %s", e)
-        order = kalshi.place_order(ticker, side, contracts, ask_price)
-        return [order] if order is not None else []
+    filled_orders: list[Order] = []
+    remaining = contracts
 
-    total_wait = max(0, cfg.PRICE_IMPROVEMENT_TIMEOUT_SEC)
-    poll = max(1, cfg.STALE_ORDER_POLL_SEC)
-    spot_moved = False
-    elapsed = 0
-
-    while elapsed < total_wait:
-        step = min(poll, total_wait - elapsed)
-        time.sleep(step)
-        elapsed += step
-
-        # Refresh order state
+    # --- Phase 0: Maker bid ($0 fee) ---
+    if cfg.ENABLE_MAKER_ORDERS and bid_price > 0.01 and bid_price < ask_price:
         try:
-            order1 = kalshi.get_order(order1.order_id)
-        except Exception:
-            pass  # use last known state
-
-        if order1.fill_count >= contracts:
+            maker_order = kalshi.place_order(ticker, side, remaining, bid_price)
             log.info(
-                "Price improvement: fully filled %d/%d @ mid (after %ds)",
-                order1.fill_count, contracts, elapsed,
+                "Maker bid: placed %d @ bid=%.3f (mid=%.3f ask=%.3f)",
+                remaining, bid_price, mid_price, ask_price,
             )
-            return [order1]
+            maker_order, spot_moved = _wait_for_fill(
+                kalshi, maker_order, remaining,
+                cfg.MAKER_ORDER_TIMEOUT_SEC, symbol, entry_spot, "maker-bid",
+            )
+            if maker_order.fill_count > 0:
+                filled_orders.append(maker_order)
+                remaining -= maker_order.fill_count
+            if remaining > 0:
+                kalshi.cancel_order(maker_order.order_id)
+            if spot_moved or remaining <= 0:
+                return filled_orders
+        except Exception as e:
+            log.warning("Maker bid order failed, continuing to mid: %s", e)
 
-        # Drift guard: cancel if the underlying has moved away from the entry spot
-        if entry_spot is not None:
-            try:
-                current_spot = get_spot_price(symbol)
-                drift = abs(current_spot - entry_spot) / entry_spot
-                if drift > cfg.STALE_ORDER_SPOT_MOVE_PCT:
-                    log.warning(
-                        "%s spot moved %.3f%% (%.0f → %.0f) during mid-price wait — cancelling %s",
-                        symbol, drift * 100, entry_spot, current_spot, order1.order_id[:8],
-                    )
-                    spot_moved = True
-                    break
-            except Exception as e:
-                log.debug("Spot price poll failed: %s", e)
+    # --- Phase 1: Mid-price ---
+    if remaining > 0 and cfg.ENABLE_PRICE_IMPROVEMENT and mid_price > 0.01 and mid_price < ask_price:
+        try:
+            mid_order = kalshi.place_order(ticker, side, remaining, mid_price)
+            log.info(
+                "Mid-price: placed %d @ mid=%.3f (ask=%.3f)",
+                remaining, mid_price, ask_price,
+            )
+            mid_order, spot_moved = _wait_for_fill(
+                kalshi, mid_order, remaining,
+                cfg.PRICE_IMPROVEMENT_TIMEOUT_SEC, symbol, entry_spot, "mid-price",
+            )
+            if mid_order.fill_count > 0:
+                filled_orders.append(mid_order)
+                remaining -= mid_order.fill_count
+            if remaining > 0:
+                kalshi.cancel_order(mid_order.order_id)
+            if spot_moved or remaining <= 0:
+                return filled_orders
+        except Exception as e:
+            log.warning("Mid-price order failed, falling back to ask: %s", e)
 
-    filled = order1.fill_count
-    if filled >= contracts:
-        log.info("Price improvement: fully filled %d/%d @ mid", filled, contracts)
-        return [order1]
+    # --- Phase 2: Ask fallback (immediate taker fill) ---
+    if remaining > 0:
+        try:
+            ask_order = kalshi.place_order(ticker, side, remaining, ask_price)
+            if ask_order is not None:
+                filled_orders.append(ask_order)
+                log.info("Ask fallback: placed %d @ ask=%.3f", remaining, ask_price)
+        except Exception as e:
+            log.error("Ask fallback order failed for %s: %s", ticker, e)
 
-    # Phase 2: cancel remainder
-    kalshi.cancel_order(order1.order_id)
-    remaining = contracts - filled
-    if remaining <= 0:
-        return [order1] if filled > 0 else []
-
-    if spot_moved:
-        # Abort ask fallback: spot has moved, so the original edge estimate is stale.
-        log.info(
-            "Skipping ask fallback after spot drift: filled=%d/%d",
-            filled, contracts,
-        )
-        return [order1] if filled > 0 else []
-
-    try:
-        order2 = kalshi.place_order(ticker, side, remaining, ask_price)
-        log.info(
-            "Price improvement: partial %d filled @ mid, %d filled @ ask",
-            filled, remaining,
-        )
-        # Return both orders so caller can account for the full blended cost.
-        results = []
-        if filled > 0:
-            results.append(order1)
-        if order2 is not None:
-            results.append(order2)
-        return results
-    except Exception as e:
-        log.error("Fallback ask order failed for %s: %s", ticker, e)
-        return [order1] if filled > 0 else []
+    return filled_orders
 
 
 def _enabled_underlyings() -> list[tuple[str, str]]:
@@ -618,12 +643,19 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     total_markets = sum(len(u.markets) for u in underlyings.values())
 
     # --- Drawdown guard ---
+    already_halted = risk.drawdown_halted
     if risk.check_drawdown(balance):
         log.warning("Drawdown limit reached — halting all trading for today")
-        alert(
-            f"Drawdown halt: balance=${balance:.2f} exceeded {cfg.MAX_DRAWDOWN_PCT:.0%} limit",
-            level="WARNING",
-        )
+        if not already_halted:
+            session_start = risk.session_start_balance
+            actual_dd = (1.0 - balance / session_start) * 100 if session_start > 0 else 0.0
+            alert(
+                f"Trading halted: balance dropped to ${balance:,.2f} "
+                f"({actual_dd:.1f}% below session start of ${session_start:,.2f}), "
+                f"exceeding the {cfg.MAX_DRAWDOWN_PCT:.0%} drawdown limit. "
+                f"No new trades until tomorrow.",
+                level="WARNING",
+            )
         store.snapshot_daily(balance, risk.daily_spent, len(positions))
         # Log the runs row using BTC's stats if available, else first underlying.
         primary = underlyings.get("BTC") or next(iter(underlyings.values()))
@@ -707,6 +739,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 contracts=contracts,
                 ask_price=sig.price,
                 mid_price=sig.mid_price,
+                bid_price=sig.bid_price,
                 dry_run=dry_run,
                 symbol=u.symbol,
             )

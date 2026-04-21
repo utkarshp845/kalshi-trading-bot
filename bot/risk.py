@@ -36,11 +36,12 @@ class DailyRisk:
         max_positions: int,
         kelly_fraction: float,
         max_drawdown_pct: float = 0.20,
-        bankroll_fraction: float = 0.25,
+        bankroll_fraction: float = 0.40,
         drawdown_tier_1_pct: float = 0.10,
         drawdown_tier_1_scale: float = 0.50,
         drawdown_tier_2_pct: float = 0.15,
         drawdown_tier_2_scale: float = 0.25,
+        correlation_discount_factor: float = 0.85,
     ):
         self.daily_spend_pct = daily_spend_pct
         self.daily_spend_floor = daily_spend_floor
@@ -53,6 +54,7 @@ class DailyRisk:
         self.drawdown_tier_1_scale = drawdown_tier_1_scale
         self.drawdown_tier_2_pct = drawdown_tier_2_pct
         self.drawdown_tier_2_scale = drawdown_tier_2_scale
+        self.correlation_discount_factor = correlation_discount_factor
 
         self._daily_spent: float = 0.0
         self._positions_opened: int = 0
@@ -127,6 +129,10 @@ class DailyRisk:
     @property
     def drawdown_halted(self) -> bool:
         return self._drawdown_halt
+
+    @property
+    def session_start_balance(self) -> float:
+        return self._session_start_balance
 
     @property
     def drawdown_scale(self) -> float:
@@ -229,10 +235,10 @@ class DailyRisk:
         # Graduated drawdown scaling: shrink sizing at tier thresholds before the hard halt.
         spend *= self._drawdown_scale
 
-        # Correlation discount: each existing position reduces sizing by 30%
-        # (all KXBTC positions bet on the same underlying)
+        # Correlation discount: each existing open position reduces sizing slightly.
+        # Was 0.70^n — at 3 positions that's 34% of Kelly, far too aggressive.
         if open_positions > 0:
-            correlation_discount = 0.7 ** open_positions
+            correlation_discount = self.correlation_discount_factor ** open_positions
             spend *= correlation_discount
             log.debug("Correlation discount: %.2f (open_positions=%d)", correlation_discount, open_positions)
 
