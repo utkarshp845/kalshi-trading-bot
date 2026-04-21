@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Optional
 
+import bot.config as cfg
 from bot.deribit_iv import get_atm_iv
 from bot.kalshi_client import KalshiClient, Market
 from bot.models import SourceSnapshot
@@ -99,9 +100,12 @@ def fetch_deribit_iv_snapshot(symbol: str, spot: float, min_dte_hours: float) ->
 def fetch_markets_snapshot(kalshi: KalshiClient, symbol: str, series_ticker: str) -> MarketsResult:
     fetched_at = _now()
     markets = kalshi.get_open_markets(series_ticker)
+    orderbooks = kalshi.get_market_orderbooks([m.ticker for m in markets], depth=cfg.ORDERBOOK_DEPTH)
+    markets = [replace(m, orderbook=orderbooks.get(m.ticker)) for m in markets]
     payload = {
         "tickers": [m.ticker for m in markets],
         "n": len(markets),
+        "orderbooks": len(orderbooks),
     }
     return MarketsResult(
         source=SourceSnapshot(

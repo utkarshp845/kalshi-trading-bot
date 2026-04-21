@@ -13,6 +13,7 @@ def _decision(symbol="BTC", degraded=False) -> SignalDecision:
         required_edge=0.15,
         expected_slippage=0.01,
         uncertainty_penalty=0.01,
+        realized_edge_proxy=0.23,
         reject_reason="",
         theo_prob=0.67,
         ask=0.30,
@@ -26,6 +27,12 @@ def _decision(symbol="BTC", degraded=False) -> SignalDecision:
         distance_from_spot_sigma=0.5,
         degraded=degraded,
         chain_break_ratio=0.0,
+        cumulative_size_at_entry=500.0,
+        top_of_book_size=250.0,
+        resting_size_at_entry=250.0,
+        expected_fill_price=0.30,
+        depth_slippage=0.0,
+        orderbook_available=True,
     )
 
 
@@ -65,4 +72,3 @@ def test_degraded_symbol_cap_reduces_size():
 def test_symbol_position_cap_blocks_new_trade():
     risk = _risk()
     assert risk.can_trade_symbol("BTC", {"BTC": 1}) is False
-

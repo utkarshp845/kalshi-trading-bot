@@ -64,11 +64,20 @@ def test_replay_reads_persisted_cycles(tmp_path):
         )
         for feature in btc_features + eth_features:
             store.log_market_snapshot(cycle_id, feature)
+        store.upsert_market_outcome(
+            ticker="KXBTC-26APR4PM-B95000",
+            result="yes",
+            settlement_value=1.0,
+            close_time="2026-04-26T20:00:00Z",
+            settlement_ts="2026-04-26T20:01:00Z",
+        )
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         output = replay(store, today, today, ["BTC", "ETH"])
 
         assert "BTC: decisions=" in output
+        assert "avg_realized_edge=" in output
+        assert "labeled=" in output
         assert "ETH: decisions=" in output
         assert "COMBINED:" in output
     finally:

@@ -23,13 +23,16 @@ class PortfolioRisk(DailyRisk):
         self.max_symbol_daily_spend_pct = max_symbol_daily_spend_pct
         self.max_symbol_positions = max_symbol_positions
         self._symbol_spent: dict[str, float] = defaultdict(float)
+        self._last_size_reason: str = ""
 
     def restore_symbol_spend(self, spent_by_symbol: dict[str, float]) -> None:
         self._symbol_spent = defaultdict(float, spent_by_symbol)
+        self._last_size_reason = ""
 
     def reset(self) -> None:
         super().reset()
         self._symbol_spent = defaultdict(float)
+        self._last_size_reason = ""
 
     def record_fill(self, cost: float, symbol: Optional[str] = None) -> None:
         super().record_fill(cost)
@@ -38,6 +41,10 @@ class PortfolioRisk(DailyRisk):
 
     def symbol_spent(self, symbol: str) -> float:
         return float(self._symbol_spent.get(symbol, 0.0))
+
+    @property
+    def last_size_reason(self) -> str:
+        return self._last_size_reason
 
     def can_trade_symbol(self, symbol: str, open_positions_by_symbol: dict[str, int]) -> bool:
         if not self.can_trade(sum(open_positions_by_symbol.values())):
@@ -56,6 +63,7 @@ class PortfolioRisk(DailyRisk):
         open_positions_by_symbol = open_positions_by_symbol or {}
         remaining_daily = self._max_daily_spend - self._daily_spent
         if remaining_daily <= 0:
+            self._last_size_reason = "daily_budget"
             return 0
 
         if current_balance > 0:
@@ -70,10 +78,12 @@ class PortfolioRisk(DailyRisk):
         remaining_symbol_budget = symbol_cap - self.symbol_spent(signal.symbol)
         remaining_budget = min(remaining_budget, remaining_symbol_budget)
         if remaining_budget <= 0:
+            self._last_size_reason = "symbol_budget"
             return 0
 
         ask = signal.ask
         if ask <= 0 or ask >= 1.0:
+            self._last_size_reason = "invalid_price"
             return 0
 
         kelly_f = signal.edge / (1.0 - ask)
@@ -91,4 +101,21 @@ class PortfolioRisk(DailyRisk):
         spend = min(spend, remaining_budget)
         contracts = math.floor(spend / ask)
         contracts = min(contracts, self.max_contracts_per_market)
-        return max(contracts, 0)
+        contracts = max(contracts, 0)
+        if contracts <= 0:
+            self._last_size_reason = "size_zero"
+            return 0
+
+        required_visible_size = cfg.LIQUIDITY_ENTRY_MULTIPLIER * contracts
+        if signal.cumulative_size_at_entry < required_visible_size:
+            self._last_size_reason = "thin_book"
+            log.info(
+                "Liquidity gate: %s visible_size=%.2f required=%.2f contracts=%d",
+                signal.ticker,
+                signal.cumulative_size_at_entry,
+                required_visible_size,
+                contracts,
+            )
+            return 0
+        self._last_size_reason = ""
+        return contracts

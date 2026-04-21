@@ -7,7 +7,7 @@ A safer mispricing bot for [Kalshi](https://kalshi.com) crypto price-level marke
 Each cycle the bot:
 
 1. Fetches BTC/ETH spot, realized vol, and trailing drift from Kraken
-2. Pulls Kalshi market quotes and optional Deribit ATM IV
+2. Pulls Kalshi market quotes, public orderbook depth, and optional Deribit ATM IV
 3. Builds per-asset snapshots and per-market features
 4. Rejects weak or noisy markets using:
    - minimum time-to-expiry
@@ -15,18 +15,21 @@ Each cycle the bot:
    - probability-band gating
    - sigma-distance gating
    - strike-chain consistency checks
+   - thin-book and depth-slippage filters
 5. Scores each candidate with a dynamic hurdle:
    - recent edge leak
    - expected slippage
    - settled-trade uncertainty penalty
-6. Sizes trades with portfolio-aware risk:
+   - orderbook depth slippage
+6. Sizes trades with portfolio-aware risk and liquidity coverage:
    - account-level caps
    - per-symbol caps
    - stronger same-asset correlation discount
    - weaker cross-asset discount
    - degraded-data budget reduction
-7. Executes with mid-price improvement and ask fallback in `live`, simulates fills in `paper`, and logs only in `observe`
-8. Persists asset runs, market snapshots, signal decisions, execution attempts, fills, and reports for replay and diagnostics
+   - visible-size gate at the intended entry price
+7. Executes with maker-first post-only entry in `live`, simulates fills in `paper`, and logs only in `observe`
+8. Persists asset runs, market snapshots, signal decisions, execution attempts, fills, labeled market outcomes, and reports for replay and diagnostics
 
 ## Trading Modes
 
@@ -113,13 +116,16 @@ Copy `.env.example` to `.env` and set your credentials plus the mode you want.
 
 | Variable | Default | Description |
 |---|---|---|
-| `THEO_PROB_BAND_MIN` | `0.15` | Lower fair-value probability gate |
-| `THEO_PROB_BAND_MAX` | `0.85` | Upper fair-value probability gate |
+| `THEO_PROB_BAND_MIN` | `0.25` | Lower fair-value probability gate |
+| `THEO_PROB_BAND_MAX` | `0.75` | Upper fair-value probability gate |
 | `MAX_SIGMA_DISTANCE` | `1.5` | Reject strikes too far from spot in modeled sigma units |
 | `MAX_CHAIN_BREAK_PCT` | `0.10` | Reject assets with too many strike-chain inconsistencies |
 | `EDGE_LEAK_LOOKBACK_FILLS` | `50` | Lookback for dynamic edge hurdle and slippage |
 | `EDGE_HURDLE_BUFFER` | `0.02` | Buffer added on top of recent edge leak |
 | `SETTLED_MAE_LOOKBACK_TRADES` | `30` | Lookback for uncertainty penalty |
+| `MAX_DEPTH_SLIPPAGE_PER_CONTRACT` | `0.02` | Reject when orderbook-implied slippage per contract exceeds this |
+| `LIQUIDITY_ENTRY_MULTIPLIER` | `5.0` | Visible resting size required vs intended contract count |
+| `ORDERBOOK_DEPTH` | `20` | Orderbook levels requested per market snapshot |
 
 ### Data Freshness
 
@@ -158,7 +164,7 @@ Replay BTC and ETH over a date range:
 python -m bot.replay --from 2026-04-01 --to 2026-04-20 --symbols BTC,ETH
 ```
 
-Replay uses persisted `asset_runs` and `market_snapshots` and reports per-symbol plus combined decision counts and capital utilization.
+Replay uses persisted `asset_runs`, `market_snapshots`, `signal_decisions`, `execution_attempts`, and labeled `market_outcomes` to report walk-forward predicted edge, realized edge, win rate, maker fill rate, cancel rate, capital utilization, and max drawdown.
 
 ## Reporting And Persistence
 
@@ -171,6 +177,7 @@ The SQLite database now stores:
 - `market_snapshots`
 - `signal_decisions`
 - `execution_attempts`
+- `market_outcomes`
 
 Daily reports now include:
 

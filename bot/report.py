@@ -184,6 +184,18 @@ def _signal_decisions_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite
     ).fetchall()
 
 
+def _execution_attempts_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT ticker, trading_mode, filled_contracts, status, reason, logged_at
+          FROM execution_attempts
+         WHERE substr(logged_at, 1, 10) = ?
+         ORDER BY logged_at ASC
+        """,
+        (date_str,),
+    ).fetchall()
+
+
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
@@ -226,6 +238,7 @@ def _render(
     runs: list[sqlite3.Row],
     asset_runs: list[sqlite3.Row],
     signal_decisions: list[sqlite3.Row],
+    execution_attempts: list[sqlite3.Row],
 ) -> str:
     lines: list[str] = []
     lines.append(f"# Daily Report - {date_str}")
@@ -309,6 +322,12 @@ def _render(
             lines.append(f"- Edge leak (predicted - realized): {_fmt_num(leak, 4)}")
     else:
         lines.append("_No fill-quality data for this date._")
+    maker_attempts = [row for row in execution_attempts if row["trading_mode"] == "live"]
+    if maker_attempts:
+        maker_fills = sum(1 for row in maker_attempts if row["status"] == "live_fill")
+        cancels = sum(1 for row in maker_attempts if row["status"] in {"no_fill", "live_no_fill"})
+        lines.append(f"- Maker fill rate: {_fmt_pct(maker_fills / len(maker_attempts))}")
+        lines.append(f"- Cancel rate: {_fmt_pct(cancels / len(maker_attempts))}")
     lines.append("")
 
     # --- Model calibration (among settled trades today) ---
@@ -452,10 +471,11 @@ def generate_report(
         runs = _runs_on(conn, date_str)
         asset_runs = _asset_runs_on(conn, date_str)
         signal_decisions = _signal_decisions_on(conn, date_str)
+        execution_attempts = _execution_attempts_on(conn, date_str)
     finally:
         conn.close()
 
-    content = _render(date_str, opened, settled, snapshot, runs, asset_runs, signal_decisions)
+    content = _render(date_str, opened, settled, snapshot, runs, asset_runs, signal_decisions, execution_attempts)
     out_path = reports_dir / f"{date_str}.md"
     out_path.write_text(content, encoding="utf-8")
     return out_path

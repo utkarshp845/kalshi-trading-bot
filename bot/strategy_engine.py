@@ -68,7 +68,8 @@ def decide_signal(
         ):
             required_edge = max(required_edge, cfg.COLD_START_MIN_EDGE)
 
-    score = feature.edge - expected_slippage - uncertainty_penalty
+    realized_edge_proxy = feature.edge - expected_slippage - uncertainty_penalty - feature.depth_slippage
+    score = realized_edge_proxy
 
     reject_reason = ""
     if not asset.tradeable:
@@ -99,6 +100,8 @@ def decide_signal(
         reject_reason = "t_too_small"
     elif not feature.spread_ok:
         reject_reason = "spread_too_wide"
+    elif feature.depth_slippage > cfg.MAX_DEPTH_SLIPPAGE_PER_CONTRACT:
+        reject_reason = "depth_slippage"
     elif not feature.last_price_ok:
         reject_reason = "last_price_diverge"
     elif not feature.chain_ok:
@@ -123,6 +126,7 @@ def decide_signal(
         required_edge=required_edge,
         expected_slippage=expected_slippage,
         uncertainty_penalty=uncertainty_penalty,
+        realized_edge_proxy=realized_edge_proxy,
         reject_reason=reject_reason,
         theo_prob=feature.contract_theo_prob,
         ask=feature.ask,
@@ -136,4 +140,11 @@ def decide_signal(
         distance_from_spot_sigma=feature.distance_from_spot_sigma,
         degraded=asset.degraded,
         chain_break_ratio=feature.chain_break_ratio,
+        top_of_book_size=feature.top_of_book_size,
+        resting_size_at_entry=feature.resting_size_at_entry,
+        cumulative_size_at_entry=feature.cumulative_size_at_entry,
+        expected_fill_price=feature.expected_fill_price,
+        depth_slippage=feature.depth_slippage,
+        orderbook_imbalance=feature.orderbook_imbalance,
+        orderbook_available=feature.orderbook_available,
     )

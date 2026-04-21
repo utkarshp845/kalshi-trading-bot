@@ -158,6 +158,13 @@ class Store:
                 enough_sane_strikes      INTEGER,
                 spread_ok                INTEGER,
                 last_price_ok            INTEGER,
+                top_of_book_size         REAL,
+                resting_size_at_entry    REAL,
+                cumulative_size_at_entry REAL,
+                expected_fill_price      REAL,
+                depth_slippage           REAL,
+                orderbook_imbalance      REAL,
+                orderbook_available      INTEGER,
                 PRIMARY KEY (cycle_id, ticker)
             );
 
@@ -171,6 +178,7 @@ class Store:
                 required_edge            REAL,
                 expected_slippage        REAL,
                 uncertainty_penalty      REAL,
+                realized_edge_proxy      REAL,
                 reject_reason            TEXT,
                 theo_prob                REAL,
                 ask                      REAL,
@@ -184,6 +192,13 @@ class Store:
                 distance_from_spot_sigma REAL,
                 degraded                 INTEGER,
                 chain_break_ratio        REAL,
+                top_of_book_size         REAL,
+                resting_size_at_entry    REAL,
+                cumulative_size_at_entry REAL,
+                expected_fill_price      REAL,
+                depth_slippage           REAL,
+                orderbook_imbalance      REAL,
+                orderbook_available      INTEGER,
                 logged_at                TEXT NOT NULL,
                 PRIMARY KEY (cycle_id, ticker, side)
             );
@@ -205,6 +220,15 @@ class Store:
                 reason                   TEXT,
                 stale_cancelled          INTEGER,
                 logged_at                TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS market_outcomes (
+                ticker                   TEXT PRIMARY KEY,
+                result                   TEXT,
+                settlement_value         REAL,
+                close_time               TEXT,
+                settlement_ts            TEXT,
+                labeled_at               TEXT NOT NULL
             );
         """)
         # Migrate existing databases that predate the new columns
@@ -251,6 +275,41 @@ class Store:
         for col, col_type in run_cols.items():
             if col not in existing_runs:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {col_type}")
+
+        market_snapshot_cols = {
+            "top_of_book_size": "REAL",
+            "resting_size_at_entry": "REAL",
+            "cumulative_size_at_entry": "REAL",
+            "expected_fill_price": "REAL",
+            "depth_slippage": "REAL",
+            "orderbook_imbalance": "REAL",
+            "orderbook_available": "INTEGER",
+        }
+        existing_market_snapshots = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(market_snapshots)").fetchall()
+        }
+        for col, col_type in market_snapshot_cols.items():
+            if col not in existing_market_snapshots:
+                self._conn.execute(f"ALTER TABLE market_snapshots ADD COLUMN {col} {col_type}")
+
+        signal_decision_cols = {
+            "realized_edge_proxy": "REAL",
+            "top_of_book_size": "REAL",
+            "resting_size_at_entry": "REAL",
+            "cumulative_size_at_entry": "REAL",
+            "expected_fill_price": "REAL",
+            "depth_slippage": "REAL",
+            "orderbook_imbalance": "REAL",
+            "orderbook_available": "INTEGER",
+        }
+        existing_signal_decisions = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(signal_decisions)").fetchall()
+        }
+        for col, col_type in signal_decision_cols.items():
+            if col not in existing_signal_decisions:
+                self._conn.execute(f"ALTER TABLE signal_decisions ADD COLUMN {col} {col_type}")
 
         self._backfill_legacy_no_side_orders()
 
@@ -464,8 +523,10 @@ class Store:
                contract_theo_prob, yes_theo_prob, ask, bid, mid, yes_bid, yes_ask,
                no_bid, no_ask, spread_abs, spread_pct, gross_edge, edge, fee,
                hours_to_expiry, distance_from_spot_sigma, last_price_divergence,
-               chain_break_ratio, chain_ok, enough_sane_strikes, spread_ok, last_price_ok)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               chain_break_ratio, chain_ok, enough_sane_strikes, spread_ok, last_price_ok,
+               top_of_book_size, resting_size_at_entry, cumulative_size_at_entry,
+               expected_fill_price, depth_slippage, orderbook_imbalance, orderbook_available)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             cycle_id, feature.symbol, feature.ticker, feature.close_time, feature.expiry_bucket,
             feature.strike, feature.side, feature.contract_theo_prob, feature.yes_theo_prob,
@@ -475,6 +536,9 @@ class Store:
             feature.distance_from_spot_sigma, feature.last_price_divergence,
             feature.chain_break_ratio, int(feature.chain_ok), int(feature.enough_sane_strikes),
             int(feature.spread_ok), int(feature.last_price_ok),
+            feature.top_of_book_size, feature.resting_size_at_entry, feature.cumulative_size_at_entry,
+            feature.expected_fill_price, feature.depth_slippage, feature.orderbook_imbalance,
+            int(feature.orderbook_available),
         ))
         self._conn.commit()
 
@@ -482,19 +546,38 @@ class Store:
         self._conn.execute("""
             INSERT OR REPLACE INTO signal_decisions
               (cycle_id, symbol, ticker, side, eligible, score, required_edge,
-               expected_slippage, uncertainty_penalty, reject_reason, theo_prob,
+               expected_slippage, uncertainty_penalty, realized_edge_proxy, reject_reason, theo_prob,
                ask, bid, mid_price, gross_edge, edge, fee, hours_to_expiry,
-               strike, distance_from_spot_sigma, degraded, chain_break_ratio, logged_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               strike, distance_from_spot_sigma, degraded, chain_break_ratio,
+               top_of_book_size, resting_size_at_entry, cumulative_size_at_entry,
+               expected_fill_price, depth_slippage, orderbook_imbalance, orderbook_available, logged_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             cycle_id, decision.symbol, decision.ticker, decision.side, int(decision.eligible),
             decision.score, decision.required_edge, decision.expected_slippage,
-            decision.uncertainty_penalty, decision.reject_reason, decision.theo_prob,
+            decision.uncertainty_penalty, decision.realized_edge_proxy, decision.reject_reason, decision.theo_prob,
             decision.ask, decision.bid, decision.mid_price, decision.gross_edge, decision.edge,
             decision.fee, decision.hours_to_expiry, decision.strike,
             decision.distance_from_spot_sigma, int(decision.degraded),
-            decision.chain_break_ratio, _now_iso(),
+            decision.chain_break_ratio, decision.top_of_book_size, decision.resting_size_at_entry,
+            decision.cumulative_size_at_entry, decision.expected_fill_price, decision.depth_slippage,
+            decision.orderbook_imbalance, int(decision.orderbook_available), _now_iso(),
         ))
+        self._conn.commit()
+
+    def upsert_market_outcome(
+        self,
+        ticker: str,
+        result: str,
+        settlement_value: float,
+        close_time: str,
+        settlement_ts: str,
+    ) -> None:
+        self._conn.execute("""
+            INSERT OR REPLACE INTO market_outcomes
+              (ticker, result, settlement_value, close_time, settlement_ts, labeled_at)
+            VALUES (?,?,?,?,?,?)
+        """, (ticker, result, settlement_value, close_time, settlement_ts, _now_iso()))
         self._conn.commit()
 
     def log_execution_attempt(
@@ -742,12 +825,44 @@ class Store:
              ORDER BY strike ASC
         """, (cycle_id, symbol)).fetchall()
 
+    def get_unlabeled_market_tickers(self, before_iso: Optional[str] = None, limit: int = 100) -> list[str]:
+        sql = """
+            SELECT DISTINCT ms.ticker
+              FROM market_snapshots ms
+              LEFT JOIN market_outcomes mo ON mo.ticker = ms.ticker
+             WHERE mo.ticker IS NULL
+               AND ms.close_time < ?
+        """
+        params: list[object] = [before_iso or _now_iso()]
+        sql += " ORDER BY ms.close_time ASC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [str(r[0]) for r in rows]
+
+    def get_market_outcomes_for_tickers(self, tickers: list[str]) -> dict[str, sqlite3.Row]:
+        if not tickers:
+            return {}
+        placeholders = ",".join("?" for _ in tickers)
+        rows = self._conn.execute(
+            f"SELECT * FROM market_outcomes WHERE ticker IN ({placeholders})",
+            tickers,
+        ).fetchall()
+        return {str(r["ticker"]): r for r in rows}
+
     def get_signal_decisions_for_cycle(self, cycle_id: str) -> list[sqlite3.Row]:
         return self._conn.execute("""
             SELECT * FROM signal_decisions
              WHERE cycle_id = ?
              ORDER BY score DESC, ticker ASC
         """, (cycle_id,)).fetchall()
+
+    def get_execution_attempts_in_range(self, date_from: str, date_to: str) -> list[sqlite3.Row]:
+        return self._conn.execute("""
+            SELECT * FROM execution_attempts
+             WHERE substr(logged_at, 1, 10) >= ?
+               AND substr(logged_at, 1, 10) <= ?
+             ORDER BY logged_at ASC
+        """, (date_from, date_to)).fetchall()
 
     def get_distinct_cycle_ids_in_range(self, date_from: str, date_to: str, symbols: list[str]) -> list[str]:
         placeholders = ",".join("?" for _ in symbols)

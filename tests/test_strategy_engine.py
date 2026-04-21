@@ -108,6 +108,17 @@ def test_decision_uses_uncertainty_penalty_in_score():
     assert decision.reject_reason == "score_non_positive"
 
 
+def test_decision_rejects_when_depth_slippage_erases_edge():
+    decision = decide_signal(
+        _Store(),
+        _asset(),
+        _feature(edge=0.18, depth_slippage=0.03, expected_fill_price=0.48, orderbook_available=True),
+        held_tickers=set(),
+    )
+    assert decision.eligible is False
+    assert decision.reject_reason == "depth_slippage"
+
+
 def test_live_mode_requires_higher_cold_start_edge():
     decision = decide_signal(_Store(), _asset(), _feature(edge=0.26), held_tickers=set(), trading_mode="live")
     assert decision.eligible is False

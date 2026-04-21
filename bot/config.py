@@ -53,11 +53,11 @@ VOL_LONG_DAYS: int = _int("VOL_LONG_DAYS", 30)       # slow vol: logged as regim
 VOL_SAFETY_MARGIN: float = _float("VOL_SAFETY_MARGIN", 1.25)  # inflate vol estimate by 25% to account for implied > realized
 MAX_VOL_RATIO: float = _float("MAX_VOL_RATIO", 1.8)  # skip trading when short/long vol ratio exceeds this (unstable regime)
 MIN_BID_ASK_SPREAD: float = _float("MIN_BID_ASK_SPREAD", 0.0)   # minimum acceptable bid (liquidity filter)
-MAX_BID_ASK_SPREAD: float = _float("MAX_BID_ASK_SPREAD", 0.25)  # skip markets where ask-bid > this (wide spread = phantom edge)
-MAX_BID_ASK_PCT_SPREAD: float = _float("MAX_BID_ASK_PCT_SPREAD", 0.30)  # skip if spread > 30% of mid-price (relative illiquidity filter)
+MAX_BID_ASK_SPREAD: float = _float("MAX_BID_ASK_SPREAD", 0.12)  # skip markets where ask-bid > this (wide spread = phantom edge)
+MAX_BID_ASK_PCT_SPREAD: float = _float("MAX_BID_ASK_PCT_SPREAD", 0.20)  # skip if spread > 20% of mid-price (relative illiquidity filter)
 MAX_LAST_PRICE_DIVERGENCE: float = _float("MAX_LAST_PRICE_DIVERGENCE", 0.15)  # skip if last_price diverges > 0.15 from yes_mid (stale/moving market)
-THEO_PROB_BAND_MIN: float = _float("THEO_PROB_BAND_MIN", 0.15)
-THEO_PROB_BAND_MAX: float = _float("THEO_PROB_BAND_MAX", 0.85)
+THEO_PROB_BAND_MIN: float = _float("THEO_PROB_BAND_MIN", 0.25)
+THEO_PROB_BAND_MAX: float = _float("THEO_PROB_BAND_MAX", 0.75)
 MAX_SIGMA_DISTANCE: float = _float("MAX_SIGMA_DISTANCE", 1.5)
 MAX_CHAIN_BREAK_PCT: float = _float("MAX_CHAIN_BREAK_PCT", 0.10)
 EDGE_LEAK_LOOKBACK_FILLS: int = _int("EDGE_LEAK_LOOKBACK_FILLS", 50)
@@ -65,6 +65,9 @@ EDGE_HURDLE_BUFFER: float = _float("EDGE_HURDLE_BUFFER", 0.02)
 SETTLED_MAE_LOOKBACK_TRADES: int = _int("SETTLED_MAE_LOOKBACK_TRADES", 30)
 DEFAULT_EXPECTED_SLIPPAGE: float = _float("DEFAULT_EXPECTED_SLIPPAGE", 0.03)
 DEFAULT_UNCERTAINTY_PENALTY: float = _float("DEFAULT_UNCERTAINTY_PENALTY", 0.05)
+MAX_DEPTH_SLIPPAGE_PER_CONTRACT: float = _float("MAX_DEPTH_SLIPPAGE_PER_CONTRACT", 0.02)
+LIQUIDITY_ENTRY_MULTIPLIER: float = _float("LIQUIDITY_ENTRY_MULTIPLIER", 5.0)
+ORDERBOOK_DEPTH: int = _int("ORDERBOOK_DEPTH", 20)
 DATA_STALE_AFTER_SEC_KRAKEN: int = _int("DATA_STALE_AFTER_SEC_KRAKEN", 20)
 DATA_STALE_AFTER_SEC_KALSHI: int = _int("DATA_STALE_AFTER_SEC_KALSHI", 20)
 DATA_STALE_AFTER_SEC_DERIBIT: int = _int("DATA_STALE_AFTER_SEC_DERIBIT", 120)
@@ -112,6 +115,7 @@ TAKE_PROFIT_MIN_HOURS: float = _float("TAKE_PROFIT_MIN_HOURS", 0.5)  # only take
 # --- Smart Order Placement ---
 ENABLE_PRICE_IMPROVEMENT: bool = _bool("ENABLE_PRICE_IMPROVEMENT", True)
 PRICE_IMPROVEMENT_TIMEOUT_SEC: int = _int("PRICE_IMPROVEMENT_TIMEOUT_SEC", 45)  # wait this long for mid-price fill
+MAKER_ENTRY_TIMEOUT_SEC: int = _int("MAKER_ENTRY_TIMEOUT_SEC", 15)
 # Stale order monitoring: during the mid-price wait, poll BTC spot; cancel if it drifts past this threshold
 STALE_ORDER_POLL_SEC: int = _int("STALE_ORDER_POLL_SEC", 10)
 STALE_ORDER_SPOT_MOVE_PCT: float = _float("STALE_ORDER_SPOT_MOVE_PCT", 0.003)  # 0.3% BTC move invalidates the mid quote

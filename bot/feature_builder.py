@@ -113,6 +113,19 @@ def build_market_features(asset: AssetSnapshot, markets: list[Market], fee: floa
         mid = (ask + bid) / 2.0
         spread_abs = ask - bid
         spread_pct = _pct_spread(bid, ask)
+        orderbook_metrics = (
+            market.orderbook.entry_metrics(side, ask)
+            if market.orderbook is not None
+            else {
+                "top_of_book_size": 0.0,
+                "resting_size_at_entry": 0.0,
+                "cumulative_size_at_entry": 0.0,
+                "expected_fill_price": None,
+                "depth_slippage": 0.0,
+                "orderbook_available": False,
+            }
+        )
+        orderbook_imbalance = market.orderbook.imbalance() if market.orderbook is not None else 0.0
         sqrt_t = math.sqrt(T_years)
         sigma_distance = 99.0
         if asset.sigma_adjusted > 0 and sqrt_t > 0:
@@ -152,6 +165,17 @@ def build_market_features(asset: AssetSnapshot, markets: list[Market], fee: floa
             "chain_break_ratio": 0.0,
             "chain_ok": True,
             "enough_sane_strikes": True,
+            "top_of_book_size": float(orderbook_metrics["top_of_book_size"]),
+            "resting_size_at_entry": float(orderbook_metrics["resting_size_at_entry"]),
+            "cumulative_size_at_entry": float(orderbook_metrics["cumulative_size_at_entry"]),
+            "expected_fill_price": (
+                float(orderbook_metrics["expected_fill_price"])
+                if orderbook_metrics["expected_fill_price"] is not None
+                else None
+            ),
+            "depth_slippage": float(orderbook_metrics["depth_slippage"]),
+            "orderbook_imbalance": orderbook_imbalance,
+            "orderbook_available": bool(orderbook_metrics["orderbook_available"]),
         }
         raw.append(raw_item)
         grouped[raw_item["expiry_bucket"]].append(raw_item)

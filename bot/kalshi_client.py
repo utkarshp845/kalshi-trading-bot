@@ -37,6 +37,88 @@ def _money_from_dict(d: dict, dollars_key: str, cents_key: str) -> float:
 
 
 @dataclass
+class OrderbookLevel:
+    price: float
+    quantity: float
+
+
+@dataclass
+class OrderbookSnapshot:
+    ticker: str
+    yes_levels: list[OrderbookLevel]
+    no_levels: list[OrderbookLevel]
+
+    @staticmethod
+    def _sorted(levels: list[OrderbookLevel]) -> list[OrderbookLevel]:
+        return sorted(levels, key=lambda level: level.price)
+
+    @classmethod
+    def from_dict(cls, ticker: str, d: dict) -> "OrderbookSnapshot":
+        payload = d.get("orderbook_fp", d)
+
+        def _levels(key: str) -> list[OrderbookLevel]:
+            levels = []
+            for raw_price, raw_qty in payload.get(key, []):
+                levels.append(OrderbookLevel(price=float(raw_price), quantity=float(raw_qty)))
+            return cls._sorted(levels)
+
+        return cls(
+            ticker=ticker,
+            yes_levels=_levels("yes_dollars"),
+            no_levels=_levels("no_dollars"),
+        )
+
+    def book_for_buy_side(self, side: str) -> list[OrderbookLevel]:
+        if side == "yes":
+            source = self.no_levels
+        else:
+            source = self.yes_levels
+        derived = [
+            OrderbookLevel(price=max(0.01, min(0.99, 1.0 - level.price)), quantity=level.quantity)
+            for level in source
+        ]
+        return self._sorted(derived)
+
+    def best_ask_for_buy_side(self, side: str) -> Optional[OrderbookLevel]:
+        levels = self.book_for_buy_side(side)
+        return levels[0] if levels else None
+
+    def entry_metrics(self, side: str, ask_price: float) -> dict[str, float | Optional[float] | bool]:
+        levels = self.book_for_buy_side(side)
+        if not levels:
+            return {
+                "top_of_book_size": 0.0,
+                "resting_size_at_entry": 0.0,
+                "cumulative_size_at_entry": 0.0,
+                "expected_fill_price": None,
+                "depth_slippage": 0.0,
+                "orderbook_available": False,
+            }
+
+        best = levels[0]
+        resting = sum(level.quantity for level in levels if abs(level.price - ask_price) <= 1e-9)
+        cumulative = sum(level.quantity for level in levels if level.price <= ask_price + 1e-9)
+        expected_fill_price = best.price
+        depth_slippage = max(0.0, best.price - ask_price)
+        return {
+            "top_of_book_size": best.quantity,
+            "resting_size_at_entry": resting,
+            "cumulative_size_at_entry": cumulative,
+            "expected_fill_price": expected_fill_price,
+            "depth_slippage": depth_slippage,
+            "orderbook_available": True,
+        }
+
+    def imbalance(self) -> float:
+        best_yes = self.yes_levels[-1].quantity if self.yes_levels else 0.0
+        best_no = self.no_levels[-1].quantity if self.no_levels else 0.0
+        denom = best_yes + best_no
+        if denom <= 0:
+            return 0.0
+        return (best_yes - best_no) / denom
+
+
+@dataclass
 class Market:
     ticker: str
     event_ticker: str
@@ -47,6 +129,7 @@ class Market:
     yes_bid: float
     no_bid: float
     last_price: Optional[float]
+    orderbook: Optional[OrderbookSnapshot] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Market":
@@ -64,6 +147,7 @@ class Market:
                 if d.get("last_price_dollars") is not None or d.get("last_price") is not None
                 else None
             ),
+            orderbook=None,
         )
 
 
@@ -190,6 +274,29 @@ class KalshiClient:
         data = self._get(path)
         return Market.from_dict(data.get("market", data))
 
+    def get_market_orderbook(self, ticker: str, depth: int = 0) -> OrderbookSnapshot:
+        path = f"/markets/{ticker}/orderbook"
+        data = self._get(path, params={"depth": depth})
+        return OrderbookSnapshot.from_dict(ticker, data)
+
+    def get_market_orderbooks(self, tickers: list[str], depth: int = 0) -> dict[str, OrderbookSnapshot]:
+        if not tickers:
+            return {}
+        path = "/markets/orderbooks"
+        data = self._get(path, params={"tickers": ",".join(tickers), "depth": depth})
+        out: dict[str, OrderbookSnapshot] = {}
+        for item in data.get("orderbooks", []):
+            ticker = item.get("ticker", "")
+            if not ticker:
+                continue
+            out[ticker] = OrderbookSnapshot.from_dict(ticker, item)
+        return out
+
+    def get_historical_market(self, ticker: str) -> dict[str, Any]:
+        path = f"/historical/markets/{ticker}"
+        data = self._get(path)
+        return data.get("market", data)
+
     # ------------------------------------------------------------------
     # Portfolio
     # ------------------------------------------------------------------
@@ -242,6 +349,9 @@ class KalshiClient:
         count: int,
         price_dollars: float,
         client_order_id: Optional[str] = None,
+        *,
+        post_only: bool = False,
+        time_in_force: Optional[str] = None,
     ) -> Order:
         """
         Place a limit buy order.
@@ -269,13 +379,18 @@ class KalshiClient:
 
         if client_order_id:
             body["client_order_id"] = client_order_id
+        if post_only:
+            body["post_only"] = True
+        if time_in_force:
+            body["time_in_force"] = time_in_force
 
         path = "/portfolio/orders"
         data = self._post(path, body)
         order = Order.from_dict(data.get("order", data))
         log.info(
-            "Order placed: %s %s %s x%d @ $%.2f → id=%s status=%s",
-            ticker, side, "buy", count, price_dollars, order.order_id, order.status,
+            "Order placed: %s %s %s x%d @ $%.2f post_only=%s tif=%s → id=%s status=%s",
+            ticker, side, "buy", count, price_dollars, post_only, time_in_force,
+            order.order_id, order.status,
         )
         return order
 

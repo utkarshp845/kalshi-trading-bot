@@ -1,5 +1,7 @@
-"""Tests for money parsing in bot/kalshi_client.py."""
-from bot.kalshi_client import KalshiClient, Market, Order
+"""Tests for money parsing and orderbook parsing in bot/kalshi_client.py."""
+import pytest
+
+from bot.kalshi_client import KalshiClient, Market, Order, OrderbookSnapshot
 
 
 class TestMoneyParsing:
@@ -52,3 +54,21 @@ class TestMoneyParsing:
         client._get = lambda _path: {"balance_dollars": "20.12", "balance": 2012}
 
         assert client.get_balance() == 20.12
+
+    def test_orderbook_snapshot_derives_buy_side_asks(self):
+        snapshot = OrderbookSnapshot.from_dict(
+            "KXBTC-26APR4PM-B95000",
+            {
+                "orderbook_fp": {
+                    "yes_dollars": [["0.4200", "30.00"]],
+                    "no_dollars": [["0.5500", "10.00"], ["0.5400", "20.00"]],
+                }
+            },
+        )
+
+        yes_asks = snapshot.book_for_buy_side("yes")
+
+        assert yes_asks[0].price == pytest.approx(0.45)
+        assert yes_asks[0].quantity == 10.0
+        assert yes_asks[1].price == pytest.approx(0.46)
+        assert snapshot.entry_metrics("yes", 0.45)["cumulative_size_at_entry"] == 10.0

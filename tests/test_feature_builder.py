@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import pytest
 
 from bot.feature_builder import build_asset_snapshot, build_market_features
+from bot.kalshi_client import OrderbookSnapshot
 from bot.models import SourceSnapshot
 from tests.conftest import make_market
 
@@ -76,3 +77,34 @@ def test_market_features_mark_chain_inconsistency_on_large_neighbor_jump():
     assert features
     assert all(feature.chain_ok is False for feature in features)
 
+
+def test_market_features_include_orderbook_depth_metrics():
+    asset = build_asset_snapshot(
+        symbol="BTC",
+        series_ticker="KXBTC",
+        price_result=_PriceResult(_source("kraken", "BTC"), 95000.0, 0.60, 0.55, 0.0),
+        markets_result=_MarketsResult(_source("kalshi", "BTC"), []),
+        iv_result=_IVResult(_source("deribit", "BTC"), 0.65),
+        store=_Store(),
+        open_positions=0,
+    )
+    market = make_market(ticker="KXBTC-26APR4PM-B95000", yes_ask=0.45, yes_bid=0.42, no_ask=0.58, no_bid=0.55)
+    market.orderbook = OrderbookSnapshot.from_dict(
+        market.ticker,
+        {
+            "orderbook_fp": {
+                "yes_dollars": [["0.4200", "30.00"]],
+                "no_dollars": [["0.5500", "10.00"]],
+            }
+        },
+    )
+
+    feature = build_market_features(asset, [market], fee=0.07)[0]
+
+    assert feature.orderbook_available is True
+    assert feature.top_of_book_size == pytest.approx(10.0)
+    assert feature.resting_size_at_entry == pytest.approx(10.0)
+    assert feature.cumulative_size_at_entry == pytest.approx(10.0)
+    assert feature.expected_fill_price == pytest.approx(0.45)
+    assert feature.depth_slippage == pytest.approx(0.0)
+    assert feature.orderbook_imbalance == pytest.approx(0.5)

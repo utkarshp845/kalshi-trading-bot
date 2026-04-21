@@ -68,6 +68,13 @@ class MarketFeature:
     enough_sane_strikes: bool
     spread_ok: bool
     last_price_ok: bool
+    top_of_book_size: float = 0.0
+    resting_size_at_entry: float = 0.0
+    cumulative_size_at_entry: float = 0.0
+    expected_fill_price: Optional[float] = None
+    depth_slippage: float = 0.0
+    orderbook_imbalance: float = 0.0
+    orderbook_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,7 @@ class SignalDecision:
     required_edge: float
     expected_slippage: float
     uncertainty_penalty: float
+    realized_edge_proxy: float
     reject_reason: str
     theo_prob: float
     ask: float
@@ -93,6 +101,13 @@ class SignalDecision:
     distance_from_spot_sigma: float
     degraded: bool
     chain_break_ratio: float
+    top_of_book_size: float = 0.0
+    resting_size_at_entry: float = 0.0
+    cumulative_size_at_entry: float = 0.0
+    expected_fill_price: Optional[float] = None
+    depth_slippage: float = 0.0
+    orderbook_imbalance: float = 0.0
+    orderbook_available: bool = False
 
     @property
     def cost_estimate(self) -> float:

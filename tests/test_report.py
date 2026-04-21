@@ -133,6 +133,7 @@ class TestGenerateReport:
             required_edge=0.20,
             expected_slippage=0.01,
             uncertainty_penalty=0.01,
+            realized_edge_proxy=-0.01,
             reject_reason="prob_band",
             theo_prob=0.90,
             ask=0.45,

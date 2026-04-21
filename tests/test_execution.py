@@ -1,11 +1,10 @@
-"""Tests for _execute_with_price_improvement in bot/main.py."""
-from dataclasses import replace
+"""Tests for maker-first execution in bot/main.py."""
 
 import pytest
 
 import bot.config as cfg
 import bot.main as main_mod
-from bot.kalshi_client import Order
+from bot.kalshi_client import Market, Order
 
 
 def _order(order_id: str, count: int, fill_count: int, fill_cost: float, price: float) -> Order:
@@ -36,8 +35,8 @@ class FakeKalshi:
         self.place_calls = []
         self.cancels = []
 
-    def place_order(self, ticker, side, contracts, price):
-        self.place_calls.append((ticker, side, contracts, price))
+    def place_order(self, ticker, side, contracts, price, **kwargs):
+        self.place_calls.append((ticker, side, contracts, price, kwargs))
         return self.place_results.pop(0)
 
     def get_order(self, order_id):
@@ -45,6 +44,19 @@ class FakeKalshi:
 
     def cancel_order(self, order_id):
         self.cancels.append(order_id)
+
+    def get_market(self, ticker):
+        return Market(
+            ticker=ticker,
+            event_ticker="KXBTC",
+            status="open",
+            close_time="2026-04-26T20:00:00Z",
+            yes_ask=0.45,
+            yes_bid=0.40,
+            no_ask=0.55,
+            no_bid=0.50,
+            last_price=0.43,
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -59,8 +71,8 @@ def _fast_price_improvement(monkeypatch):
 
 
 class TestExecuteWithPriceImprovement:
-    def test_full_mid_fill_returns_single_order(self):
-        full = _order("o1", count=10, fill_count=10, fill_cost=4.20, price=0.42)
+    def test_full_passive_fill_returns_single_order(self):
+        full = _order("o1", count=10, fill_count=10, fill_cost=4.00, price=0.40)
         kalshi = FakeKalshi(place_results=[full], get_results={"o1": full})
 
         orders = main_mod._execute_with_price_improvement(
@@ -70,40 +82,15 @@ class TestExecuteWithPriceImprovement:
 
         assert len(orders) == 1
         assert orders[0].fill_count == 10
-        assert orders[0].taker_fill_cost == pytest.approx(4.20)
+        assert orders[0].taker_fill_cost == pytest.approx(4.00)
         assert kalshi.cancels == []
+        assert kalshi.place_calls == [("KXBTC-26APR4PM-B95000", "yes", 10, 0.40, {"post_only": True})]
 
-    def test_partial_mid_then_ask_returns_both_orders(self):
-        """The bug this fixes: partial mid + ask fallback must account for BOTH fills."""
-        mid_partial = _order("o1", count=10, fill_count=3, fill_cost=1.26, price=0.42)
-        ask_fill = _order("o2", count=7, fill_count=7, fill_cost=3.15, price=0.45)
+    def test_partial_passive_fill_returns_partial_after_cancel(self):
+        passive_partial = _order("o1", count=10, fill_count=3, fill_cost=1.20, price=0.40)
         kalshi = FakeKalshi(
-            place_results=[mid_partial, ask_fill],
-            get_results={"o1": mid_partial},
-        )
-
-        orders = main_mod._execute_with_price_improvement(
-            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
-            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
-        )
-
-        assert len(orders) == 2
-        total_filled = sum(o.fill_count for o in orders)
-        total_cost = sum(o.taker_fill_cost for o in orders)
-        assert total_filled == 10
-        assert total_cost == pytest.approx(4.41)
-        # Cancel the unfilled remainder of the mid order before re-placing at ask.
-        assert kalshi.cancels == ["o1"]
-        # Second placement is the remainder at ask.
-        assert kalshi.place_calls[1] == ("KXBTC-26APR4PM-B95000", "yes", 7, 0.45)
-
-    def test_zero_mid_fill_then_full_ask_returns_only_ask(self):
-        """When mid fills nothing, only the ask order should be logged (no phantom order1)."""
-        mid_none = _order("o1", count=10, fill_count=0, fill_cost=0.0, price=0.42)
-        ask_fill = _order("o2", count=10, fill_count=10, fill_cost=4.50, price=0.45)
-        kalshi = FakeKalshi(
-            place_results=[mid_none, ask_fill],
-            get_results={"o1": mid_none},
+            place_results=[passive_partial],
+            get_results={"o1": passive_partial},
         )
 
         orders = main_mod._execute_with_price_improvement(
@@ -112,14 +99,30 @@ class TestExecuteWithPriceImprovement:
         )
 
         assert len(orders) == 1
-        assert orders[0].order_id == "o2"
-        assert orders[0].taker_fill_cost == pytest.approx(4.50)
+        assert orders[0].order_id == "o1"
+        assert orders[0].fill_count == 3
+        assert kalshi.cancels == ["o1"]
+        assert len(kalshi.place_calls) == 1
+
+    def test_zero_passive_fill_returns_empty_after_cancel(self):
+        passive_none = _order("o1", count=10, fill_count=0, fill_cost=0.0, price=0.40)
+        kalshi = FakeKalshi(
+            place_results=[passive_none],
+            get_results={"o1": passive_none},
+        )
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+        )
+
+        assert orders == []
         assert kalshi.cancels == ["o1"]
 
-    def test_disabled_price_improvement_skips_mid(self, monkeypatch):
+    def test_disabled_price_improvement_still_posts_passive(self, monkeypatch):
         monkeypatch.setattr(cfg, "ENABLE_PRICE_IMPROVEMENT", False)
-        ask_fill = _order("o1", count=10, fill_count=10, fill_cost=4.50, price=0.45)
-        kalshi = FakeKalshi(place_results=[ask_fill])
+        passive_fill = _order("o1", count=10, fill_count=10, fill_cost=4.00, price=0.40)
+        kalshi = FakeKalshi(place_results=[passive_fill])
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
@@ -127,7 +130,7 @@ class TestExecuteWithPriceImprovement:
         )
 
         assert len(orders) == 1
-        assert kalshi.place_calls == [("KXBTC-26APR4PM-B95000", "yes", 10, 0.45)]
+        assert kalshi.place_calls == [("KXBTC-26APR4PM-B95000", "yes", 10, 0.40, {"post_only": True})]
         assert kalshi.cancels == []
 
     def test_spot_drift_cancels_and_skips_ask_fallback(self, monkeypatch):
@@ -139,10 +142,10 @@ class TestExecuteWithPriceImprovement:
         spot_sequence = iter([95000.0, 95500.0])
         monkeypatch.setattr(main_mod, "get_spot_price", lambda symbol="BTC": next(spot_sequence))
 
-        mid_partial = _order("o1", count=10, fill_count=0, fill_cost=0.0, price=0.42)
+        passive_partial = _order("o1", count=10, fill_count=0, fill_cost=0.0, price=0.40)
         kalshi = FakeKalshi(
-            place_results=[mid_partial],
-            get_results={"o1": mid_partial},
+            place_results=[passive_partial],
+            get_results={"o1": passive_partial},
         )
 
         orders = main_mod._execute_with_price_improvement(
@@ -150,26 +153,24 @@ class TestExecuteWithPriceImprovement:
             contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
         )
 
-        # Mid order cancelled, no ask fallback placed → no fills returned
+        # Passive order cancelled, no taker-style fallback placed → no fills returned
         assert orders == []
         assert kalshi.cancels == ["o1"]
-        # Only one place_order call (the mid); no ask fallback
+        # Only one passive placement; no ask fallback
         assert len(kalshi.place_calls) == 1
 
-    def test_spot_within_tolerance_continues_to_ask_fallback(self, monkeypatch):
-        """If BTC drift stays within threshold, normal ask fallback proceeds on remainder."""
-        monkeypatch.setattr(cfg, "PRICE_IMPROVEMENT_TIMEOUT_SEC", 10)
+    def test_spot_within_tolerance_keeps_partial_passive_fill_only(self, monkeypatch):
+        """If BTC drift stays within threshold, maker-first still cancels remainder instead of crossing."""
         monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 10)
         monkeypatch.setattr(cfg, "STALE_ORDER_SPOT_MOVE_PCT", 0.01)  # 1% tolerance
         # Entry 95000, poll sees 95100 (~0.1% drift, under threshold)
         spot_sequence = iter([95000.0, 95100.0])
         monkeypatch.setattr(main_mod, "get_spot_price", lambda symbol="BTC": next(spot_sequence))
 
-        mid_partial = _order("o1", count=10, fill_count=3, fill_cost=1.26, price=0.42)
-        ask_fill = _order("o2", count=7, fill_count=7, fill_cost=3.15, price=0.45)
+        passive_partial = _order("o1", count=10, fill_count=3, fill_cost=1.20, price=0.40)
         kalshi = FakeKalshi(
-            place_results=[mid_partial, ask_fill],
-            get_results={"o1": mid_partial},
+            place_results=[passive_partial],
+            get_results={"o1": passive_partial},
         )
 
         orders = main_mod._execute_with_price_improvement(
@@ -177,13 +178,13 @@ class TestExecuteWithPriceImprovement:
             contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
         )
 
-        assert len(orders) == 2
+        assert len(orders) == 1
         assert kalshi.cancels == ["o1"]
-        assert kalshi.place_calls[1] == ("KXBTC-26APR4PM-B95000", "yes", 7, 0.45)
+        assert len(kalshi.place_calls) == 1
 
-    def test_mid_at_or_above_ask_skips_improvement(self):
-        ask_fill = _order("o1", count=10, fill_count=10, fill_cost=4.50, price=0.45)
-        kalshi = FakeKalshi(place_results=[ask_fill])
+    def test_mid_at_or_above_ask_still_uses_passive_bid(self):
+        passive_fill = _order("o1", count=10, fill_count=10, fill_cost=4.00, price=0.40)
+        kalshi = FakeKalshi(place_results=[passive_fill], get_results={"o1": passive_fill})
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
@@ -191,4 +192,4 @@ class TestExecuteWithPriceImprovement:
         )
 
         assert len(orders) == 1
-        assert kalshi.place_calls == [("KXBTC-26APR4PM-B95000", "yes", 10, 0.45)]
+        assert kalshi.place_calls == [("KXBTC-26APR4PM-B95000", "yes", 10, 0.40, {"post_only": True})]
