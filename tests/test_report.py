@@ -42,7 +42,7 @@ class TestGenerateReport:
         out = generate_report(today, store._db_path, tmp_path / "reports")
         assert out.exists()
         content = out.read_text()
-        assert f"Daily Report — {today}" in content
+        assert f"Daily Report - {today}" in content
         assert "No orders placed" in content
         assert "No run records" in content
 
@@ -99,8 +99,60 @@ class TestGenerateReport:
         out = generate_report(today, store._db_path, tmp_path / "reports")
         content = out.read_text()
         assert "Cycles run: 2" in content
-        assert "$95,000 – $95,500" in content
-        assert "8 → 3" in content  # total signals → orders
+        assert "$95,000 - $95,500" in content
+        assert "8 -> 3" in content  # total signals -> orders
+
+    def test_asset_diagnostics_and_decision_quality_sections(self, store, tmp_path):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from bot.models import AssetSnapshot, MarketFeature, SignalDecision, SourceSnapshot
+
+        source = SourceSnapshot("test", "BTC", datetime.now(timezone.utc).isoformat(), 0.0, "fresh", "hash")
+        asset = AssetSnapshot(
+            symbol="BTC",
+            series_ticker="KXBTC",
+            spot=95000.0,
+            sigma_short=0.6,
+            sigma_long=0.55,
+            sigma_adjusted=0.7,
+            mu=0.0,
+            iv_rv_ratio=1.2,
+            adaptive_margin=1.25,
+            spot_source=source,
+            markets_source=source,
+            iv_source=source,
+            degraded=True,
+            health_status="healthy",
+        )
+        store.log_asset_run(datetime.now(timezone.utc).isoformat(), asset)
+        store.log_signal_decision(datetime.now(timezone.utc).isoformat(), SignalDecision(
+            symbol="BTC",
+            ticker="KXBTC-26APR4PM-B95000",
+            side="yes",
+            eligible=False,
+            score=-0.01,
+            required_edge=0.20,
+            expected_slippage=0.01,
+            uncertainty_penalty=0.01,
+            realized_edge_proxy=-0.01,
+            reject_reason="prob_band",
+            theo_prob=0.90,
+            ask=0.45,
+            bid=0.42,
+            mid_price=0.435,
+            gross_edge=0.22,
+            edge=0.15,
+            fee=0.07,
+            hours_to_expiry=4.0,
+            strike=95000.0,
+            distance_from_spot_sigma=0.8,
+            degraded=True,
+            chain_break_ratio=0.0,
+        ))
+
+        out = generate_report(today, store._db_path, tmp_path / "reports")
+        content = out.read_text()
+        assert "Decision Quality" in content
+        assert "Asset Diagnostics" in content
 
     def test_snapshot_appears_in_summary(self, store, tmp_path):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")

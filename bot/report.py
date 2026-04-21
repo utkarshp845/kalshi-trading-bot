@@ -158,6 +158,44 @@ def _runs_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _asset_runs_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT symbol, spot, sigma_short, sigma_long, sigma_adjusted, health_status,
+               degraded, open_positions, run_at
+          FROM asset_runs
+         WHERE substr(run_at, 1, 10) = ?
+         ORDER BY run_at ASC, symbol ASC
+        """,
+        (date_str,),
+    ).fetchall()
+
+
+def _signal_decisions_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT symbol, ticker, side, eligible, score, required_edge,
+               expected_slippage, uncertainty_penalty, reject_reason, logged_at
+          FROM signal_decisions
+         WHERE substr(logged_at, 1, 10) = ?
+         ORDER BY logged_at ASC
+        """,
+        (date_str,),
+    ).fetchall()
+
+
+def _execution_attempts_on(conn: sqlite3.Connection, date_str: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT ticker, trading_mode, filled_contracts, status, reason, logged_at
+          FROM execution_attempts
+         WHERE substr(logged_at, 1, 10) = ?
+         ORDER BY logged_at ASC
+        """,
+        (date_str,),
+    ).fetchall()
+
+
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
@@ -169,23 +207,23 @@ def _avg(values: list[float]) -> Optional[float]:
 
 def _fmt_money(v: Optional[float]) -> str:
     if v is None:
-        return "—"
+        return "-"
     sign = "-" if v < 0 else ""
     return f"{sign}${abs(v):.2f}"
 
 
 def _fmt_signed_money(v: Optional[float]) -> str:
     if v is None:
-        return "—"
+        return "-"
     return f"{'+' if v >= 0 else '-'}${abs(v):.2f}"
 
 
 def _fmt_num(v: Optional[float], digits: int = 4) -> str:
-    return "—" if v is None else f"{v:.{digits}f}"
+    return "-" if v is None else f"{v:.{digits}f}"
 
 
 def _fmt_pct(v: Optional[float]) -> str:
-    return "—" if v is None else f"{v * 100:.2f}%"
+    return "-" if v is None else f"{v * 100:.2f}%"
 
 
 # ----------------------------------------------------------------------
@@ -198,9 +236,12 @@ def _render(
     settled: list[TradeRow],
     snapshot: Optional[sqlite3.Row],
     runs: list[sqlite3.Row],
+    asset_runs: list[sqlite3.Row],
+    signal_decisions: list[sqlite3.Row],
+    execution_attempts: list[sqlite3.Row],
 ) -> str:
     lines: list[str] = []
-    lines.append(f"# Daily Report — {date_str}")
+    lines.append(f"# Daily Report - {date_str}")
     lines.append("")
     lines.append(f"_Generated {datetime.now(timezone.utc).isoformat(timespec='seconds')}_")
     lines.append("")
@@ -234,7 +275,7 @@ def _render(
         lines.append("|---|---|---|---|---|---|---|---|")
         for t in opened:
             tstamp = t.logged_at[11:19] if len(t.logged_at) >= 19 else t.logged_at
-            edge_str = _fmt_num(t.edge, 3) if t.edge is not None else "—"
+            edge_str = _fmt_num(t.edge, 3) if t.edge is not None else "-"
             lines.append(
                 f"| {tstamp} | {t.ticker} | {t.side} | {t.count} | {t.fill_count} | "
                 f"{_fmt_money(t.cost_dollars)} | {edge_str} | {t.status} |"
@@ -250,7 +291,7 @@ def _render(
         wins = sum(1 for t in settled if (t.settled_value or 0) >= 1.0)
         losses = len(settled) - wins
         win_rate = wins / len(settled) if settled else 0.0
-        lines.append(f"- Settled: {len(settled)}  ({wins}W / {losses}L — win rate {_fmt_pct(win_rate)})")
+        lines.append(f"- Settled: {len(settled)}  ({wins}W / {losses}L - win rate {_fmt_pct(win_rate)})")
         lines.append(f"- Realized P&L: {_fmt_signed_money(realized_pnl)}")
         lines.append("")
         lines.append("| Ticker | Side | Qty | Cost | Outcome | P&L |")
@@ -278,9 +319,15 @@ def _render(
         lines.append(f"- Avg realized edge (after slippage): {_fmt_num(avg_realized_edge, 4)}")
         if avg_pred_edge is not None and avg_realized_edge is not None:
             leak = avg_pred_edge - avg_realized_edge
-            lines.append(f"- Edge leak (predicted − realized): {_fmt_num(leak, 4)}")
+            lines.append(f"- Edge leak (predicted - realized): {_fmt_num(leak, 4)}")
     else:
         lines.append("_No fill-quality data for this date._")
+    maker_attempts = [row for row in execution_attempts if row["trading_mode"] == "live"]
+    if maker_attempts:
+        maker_fills = sum(1 for row in maker_attempts if row["status"] == "live_fill")
+        cancels = sum(1 for row in maker_attempts if row["status"] in {"no_fill", "live_no_fill"})
+        lines.append(f"- Maker fill rate: {_fmt_pct(maker_fills / len(maker_attempts))}")
+        lines.append(f"- Cancel rate: {_fmt_pct(cancels / len(maker_attempts))}")
     lines.append("")
 
     # --- Model calibration (among settled trades today) ---
@@ -294,13 +341,13 @@ def _render(
     if cal_samples:
         bias = sum(sv - tp for sv, tp in cal_samples) / len(cal_samples)
         lines.append(f"- Samples (settled today with predictions): {len(cal_samples)}")
-        lines.append(f"- Avg (settled − predicted): {_fmt_num(bias, 4)}")
+        lines.append(f"- Avg (settled - predicted): {_fmt_num(bias, 4)}")
         if bias > 0.05:
             lines.append("  - Model is **under-predicting** probability; consider tightening safety margin.")
         elif bias < -0.05:
             lines.append("  - Model is **over-predicting** probability; consider widening safety margin.")
         else:
-            lines.append("  - Model calibration within ±5% tolerance.")
+            lines.append("  - Model calibration within +/-5% tolerance.")
     else:
         lines.append("_Not enough settled+predicted samples for today's calibration._")
     lines.append("")
@@ -323,14 +370,62 @@ def _render(
 
         lines.append(f"- Cycles run: {len(runs)}")
         if btc_prices:
-            lines.append(f"- BTC range: ${min(btc_prices):,.0f} – ${max(btc_prices):,.0f}")
-        lines.append(f"- Avg σ_short/σ_long: {_fmt_num(_avg(vol_ratios), 3)}")
+            lines.append(f"- BTC range: ${min(btc_prices):,.0f} - ${max(btc_prices):,.0f}")
+        lines.append(f"- Avg sigma_short/sigma_long: {_fmt_num(_avg(vol_ratios), 3)}")
         lines.append(f"- Avg IV/RV ratio: {_fmt_num(_avg(iv_rv_ratios), 3)}")
         lines.append(f"- Avg adaptive safety margin: {_fmt_num(_avg(margins), 3)}")
-        lines.append(f"- Signals found → orders placed: {total_signals} → {total_orders}"
+        lines.append(f"- Signals found -> orders placed: {total_signals} -> {total_orders}"
                      + (f" ({_fmt_pct(conversion)})" if conversion is not None else ""))
     else:
         lines.append("_No run records for this date._")
+    lines.append("")
+
+    lines.append("## Decision Quality")
+    lines.append("")
+    if signal_decisions:
+        reject_counts: dict[str, int] = {}
+        eligible_by_symbol: dict[str, int] = {}
+        for row in signal_decisions:
+            symbol = row["symbol"] or "UNK"
+            if row["eligible"]:
+                eligible_by_symbol[symbol] = eligible_by_symbol.get(symbol, 0) + 1
+            else:
+                reason = row["reject_reason"] or "unknown"
+                reject_counts[reason] = reject_counts.get(reason, 0) + 1
+        lines.append(f"- Decisions logged: {len(signal_decisions)}")
+        if eligible_by_symbol:
+            summary = ", ".join(f"{symbol}={count}" for symbol, count in sorted(eligible_by_symbol.items()))
+            lines.append(f"- Eligible by symbol: {summary}")
+        if reject_counts:
+            top_rejects = sorted(reject_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+            lines.append("- Top reject reasons: " + ", ".join(f"{reason}={count}" for reason, count in top_rejects))
+    else:
+        lines.append("_No signal-decision records for this date._")
+    lines.append("")
+
+    lines.append("## Asset Diagnostics")
+    lines.append("")
+    if asset_runs:
+        by_symbol: dict[str, list[sqlite3.Row]] = {}
+        for row in asset_runs:
+            by_symbol.setdefault(row["symbol"], []).append(row)
+        for symbol, rows in sorted(by_symbol.items()):
+            degraded = sum(1 for row in rows if row["degraded"])
+            health_counts: dict[str, int] = {}
+            for row in rows:
+                status = row["health_status"] or "unknown"
+                health_counts[status] = health_counts.get(status, 0) + 1
+            spot_min = min(row["spot"] for row in rows if row["spot"] is not None)
+            spot_max = max(row["spot"] for row in rows if row["spot"] is not None)
+            symbol_settled = [t for t in settled if t.ticker.startswith(f"KX{symbol}")]
+            symbol_pnl = sum((t.settled_pnl or 0.0) for t in symbol_settled)
+            lines.append(
+                f"- {symbol}: cycles={len(rows)} degraded={degraded} "
+                f"spot=${spot_min:,.0f}-${spot_max:,.0f} settled_pnl={_fmt_signed_money(symbol_pnl)} "
+                f"health={','.join(f'{k}:{v}' for k, v in sorted(health_counts.items()))}"
+            )
+    else:
+        lines.append("_No asset-run records for this date._")
     lines.append("")
 
     # --- Best / worst ---
@@ -340,8 +435,8 @@ def _render(
         lines.append("")
         best = max(realized_trades, key=lambda t: t.settled_pnl)
         worst = min(realized_trades, key=lambda t: t.settled_pnl)
-        lines.append(f"- **Best**: {best.ticker} ({best.side}) → {_fmt_signed_money(best.settled_pnl)}")
-        lines.append(f"- **Worst**: {worst.ticker} ({worst.side}) → {_fmt_signed_money(worst.settled_pnl)}")
+        lines.append(f"- **Best**: {best.ticker} ({best.side}) -> {_fmt_signed_money(best.settled_pnl)}")
+        lines.append(f"- **Worst**: {worst.ticker} ({worst.side}) -> {_fmt_signed_money(worst.settled_pnl)}")
         lines.append("")
 
     return "\n".join(lines)
@@ -374,12 +469,15 @@ def generate_report(
         settled = _orders_settled_on(conn, date_str)
         snapshot = _latest_snapshot(conn, date_str)
         runs = _runs_on(conn, date_str)
+        asset_runs = _asset_runs_on(conn, date_str)
+        signal_decisions = _signal_decisions_on(conn, date_str)
+        execution_attempts = _execution_attempts_on(conn, date_str)
     finally:
         conn.close()
 
-    content = _render(date_str, opened, settled, snapshot, runs)
+    content = _render(date_str, opened, settled, snapshot, runs, asset_runs, signal_decisions, execution_attempts)
     out_path = reports_dir / f"{date_str}.md"
-    out_path.write_text(content)
+    out_path.write_text(content, encoding="utf-8")
     return out_path
 
 

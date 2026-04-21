@@ -6,6 +6,8 @@ Every request is signed with:
   KALSHI-ACCESS-TIMESTAMP: Unix timestamp in milliseconds (string)
   KALSHI-ACCESS-SIGNATURE: base64(RSA-PSS-SHA256(timestamp_ms + METHOD + /path))
 """
+from __future__ import annotations
+
 import base64
 import logging
 import time
@@ -21,6 +23,103 @@ from cryptography.hazmat.primitives.asymmetric import padding
 log = logging.getLogger(__name__)
 
 
+def _money_from_dict(d: dict, dollars_key: str, cents_key: str) -> float:
+    """
+    Read a money field from Kalshi JSON.
+
+    The API commonly exposes both `*_dollars` and raw cent-denominated integer
+    variants. Prefer the explicit dollar field when present; otherwise treat the
+    raw field as cents.
+    """
+    if d.get(dollars_key) is not None:
+        return float(d[dollars_key])
+    if d.get(cents_key) is not None:
+        return float(d[cents_key]) / 100.0
+    return 0.0
+
+
+@dataclass
+class OrderbookLevel:
+    price: float
+    quantity: float
+
+
+@dataclass
+class OrderbookSnapshot:
+    ticker: str
+    yes_levels: list[OrderbookLevel]
+    no_levels: list[OrderbookLevel]
+
+    @staticmethod
+    def _sorted(levels: list[OrderbookLevel]) -> list[OrderbookLevel]:
+        return sorted(levels, key=lambda level: level.price)
+
+    @classmethod
+    def from_dict(cls, ticker: str, d: dict) -> "OrderbookSnapshot":
+        payload = d.get("orderbook_fp", d)
+
+        def _levels(key: str) -> list[OrderbookLevel]:
+            levels = []
+            for raw_price, raw_qty in payload.get(key, []):
+                levels.append(OrderbookLevel(price=float(raw_price), quantity=float(raw_qty)))
+            return cls._sorted(levels)
+
+        return cls(
+            ticker=ticker,
+            yes_levels=_levels("yes_dollars"),
+            no_levels=_levels("no_dollars"),
+        )
+
+    def book_for_buy_side(self, side: str) -> list[OrderbookLevel]:
+        if side == "yes":
+            source = self.no_levels
+        else:
+            source = self.yes_levels
+        derived = [
+            OrderbookLevel(price=max(0.01, min(0.99, 1.0 - level.price)), quantity=level.quantity)
+            for level in source
+        ]
+        return self._sorted(derived)
+
+    def best_ask_for_buy_side(self, side: str) -> Optional[OrderbookLevel]:
+        levels = self.book_for_buy_side(side)
+        return levels[0] if levels else None
+
+    def entry_metrics(self, side: str, ask_price: float) -> dict[str, float | Optional[float] | bool]:
+        levels = self.book_for_buy_side(side)
+        if not levels:
+            return {
+                "top_of_book_size": 0.0,
+                "resting_size_at_entry": 0.0,
+                "cumulative_size_at_entry": 0.0,
+                "expected_fill_price": None,
+                "depth_slippage": 0.0,
+                "orderbook_available": False,
+            }
+
+        best = levels[0]
+        resting = sum(level.quantity for level in levels if abs(level.price - ask_price) <= 1e-9)
+        cumulative = sum(level.quantity for level in levels if level.price <= ask_price + 1e-9)
+        expected_fill_price = best.price
+        depth_slippage = max(0.0, best.price - ask_price)
+        return {
+            "top_of_book_size": best.quantity,
+            "resting_size_at_entry": resting,
+            "cumulative_size_at_entry": cumulative,
+            "expected_fill_price": expected_fill_price,
+            "depth_slippage": depth_slippage,
+            "orderbook_available": True,
+        }
+
+    def imbalance(self) -> float:
+        best_yes = self.yes_levels[-1].quantity if self.yes_levels else 0.0
+        best_no = self.no_levels[-1].quantity if self.no_levels else 0.0
+        denom = best_yes + best_no
+        if denom <= 0:
+            return 0.0
+        return (best_yes - best_no) / denom
+
+
 @dataclass
 class Market:
     ticker: str
@@ -32,6 +131,7 @@ class Market:
     yes_bid: float
     no_bid: float
     last_price: Optional[float]
+    orderbook: Optional[OrderbookSnapshot] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Market":
@@ -40,11 +140,16 @@ class Market:
             event_ticker=d.get("event_ticker", ""),
             status=d.get("status", ""),
             close_time=d.get("close_time", ""),
-            yes_ask=float(d.get("yes_ask_dollars") or d.get("yes_ask", 0) / 100),
-            no_ask=float(d.get("no_ask_dollars") or d.get("no_ask", 0) / 100),
-            yes_bid=float(d.get("yes_bid_dollars") or d.get("yes_bid", 0) / 100),
-            no_bid=float(d.get("no_bid_dollars") or d.get("no_bid", 0) / 100),
-            last_price=float(d["last_price_dollars"]) if d.get("last_price_dollars") is not None else None,
+            yes_ask=_money_from_dict(d, "yes_ask_dollars", "yes_ask"),
+            no_ask=_money_from_dict(d, "no_ask_dollars", "no_ask"),
+            yes_bid=_money_from_dict(d, "yes_bid_dollars", "yes_bid"),
+            no_bid=_money_from_dict(d, "no_bid_dollars", "no_bid"),
+            last_price=(
+                _money_from_dict(d, "last_price_dollars", "last_price")
+                if d.get("last_price_dollars") is not None or d.get("last_price") is not None
+                else None
+            ),
+            orderbook=None,
         )
 
 
@@ -72,11 +177,11 @@ class Order:
             side=d.get("side", ""),
             action=d.get("action", ""),
             status=d.get("status", ""),
-            yes_price=float(d.get("yes_price_dollars") or 0),
-            no_price=float(d.get("no_price_dollars") or 0),
+            yes_price=_money_from_dict(d, "yes_price_dollars", "yes_price"),
+            no_price=_money_from_dict(d, "no_price_dollars", "no_price"),
             count=int(float(d.get("initial_count_fp") or 0)),
             fill_count=int(float(d.get("fill_count_fp") or 0)),
-            taker_fill_cost=float(d.get("taker_fill_cost_dollars") or 0),
+            taker_fill_cost=_money_from_dict(d, "taker_fill_cost_dollars", "taker_fill_cost"),
             created_time=d.get("created_time", ""),
         )
 
@@ -171,6 +276,29 @@ class KalshiClient:
         data = self._get(path)
         return Market.from_dict(data.get("market", data))
 
+    def get_market_orderbook(self, ticker: str, depth: int = 0) -> OrderbookSnapshot:
+        path = f"/markets/{ticker}/orderbook"
+        data = self._get(path, params={"depth": depth})
+        return OrderbookSnapshot.from_dict(ticker, data)
+
+    def get_market_orderbooks(self, tickers: list[str], depth: int = 0) -> dict[str, OrderbookSnapshot]:
+        if not tickers:
+            return {}
+        path = "/markets/orderbooks"
+        data = self._get(path, params={"tickers": ",".join(tickers), "depth": depth})
+        out: dict[str, OrderbookSnapshot] = {}
+        for item in data.get("orderbooks", []):
+            ticker = item.get("ticker", "")
+            if not ticker:
+                continue
+            out[ticker] = OrderbookSnapshot.from_dict(ticker, item)
+        return out
+
+    def get_historical_market(self, ticker: str) -> dict[str, Any]:
+        path = f"/historical/markets/{ticker}"
+        data = self._get(path)
+        return data.get("market", data)
+
     # ------------------------------------------------------------------
     # Portfolio
     # ------------------------------------------------------------------
@@ -179,9 +307,12 @@ class KalshiClient:
         """Return available balance in USD."""
         path = "/portfolio/balance"
         data = self._get(path)
-        balance_cents = float(data.get("balance", data.get("available_balance", 0)))
-        balance = balance_cents / 100.0
-        log.debug("Account balance: $%.2f (raw cents: %.0f)", balance, balance_cents)
+        balance = (
+            _money_from_dict(data, "balance_dollars", "balance")
+            if data.get("balance_dollars") is not None or data.get("balance") is not None
+            else _money_from_dict(data, "available_balance_dollars", "available_balance")
+        )
+        log.debug("Account balance: $%.2f", balance)
         return balance
 
     def get_positions(self) -> list[Position]:
@@ -197,14 +328,14 @@ class KalshiClient:
                     ticker=p["ticker"],
                     side="yes",
                     quantity=qty_yes,
-                    cost=float(p.get("cost_basis_yes_dollars", 0)),
+                    cost=_money_from_dict(p, "cost_basis_yes_dollars", "cost_basis_yes"),
                 ))
             if qty_no > 0:
                 positions.append(Position(
                     ticker=p["ticker"],
                     side="no",
                     quantity=qty_no,
-                    cost=float(p.get("cost_basis_no_dollars", 0)),
+                    cost=_money_from_dict(p, "cost_basis_no_dollars", "cost_basis_no"),
                 ))
         log.debug("Open positions: %d", len(positions))
         return positions
@@ -220,6 +351,9 @@ class KalshiClient:
         count: int,
         price_dollars: float,
         client_order_id: Optional[str] = None,
+        *,
+        post_only: bool = False,
+        time_in_force: Optional[str] = None,
     ) -> Order:
         """
         Place a limit buy order.
@@ -247,13 +381,18 @@ class KalshiClient:
 
         if client_order_id:
             body["client_order_id"] = client_order_id
+        if post_only:
+            body["post_only"] = True
+        if time_in_force:
+            body["time_in_force"] = time_in_force
 
         path = "/portfolio/orders"
         data = self._post(path, body)
         order = Order.from_dict(data.get("order", data))
         log.info(
-            "Order placed: %s %s %s x%d @ $%.2f → id=%s status=%s",
-            ticker, side, "buy", count, price_dollars, order.order_id, order.status,
+            "Order placed: %s %s %s x%d @ $%.2f post_only=%s tif=%s → id=%s status=%s",
+            ticker, side, "buy", count, price_dollars, post_only, time_in_force,
+            order.order_id, order.status,
         )
         return order
 

@@ -11,21 +11,27 @@ import math
 import statistics
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
 
 import bot.config as cfg
 from bot.deribit_iv import get_atm_iv
+from bot.feature_builder import build_asset_snapshot, build_market_features
 from bot.implied_vol import fit_cycle_iv
 from bot.kalshi_client import KalshiClient, Market, Order, Position
+from bot.models import AssetSnapshot
 from bot.monitor import alert
+from bot.portfolio_risk import PortfolioRisk
 from bot.price_feed import get_price_vol_drift, get_spot_price
 from bot.pricing import calc_prob
+from bot.providers import fetch_deribit_iv_snapshot, fetch_markets_snapshot, fetch_price_snapshot
 from bot.report import generate_report
 from bot.risk import DailyRisk
 from bot.store import Store
 from bot.strategy import Signal, _hours_to_expiry, _parse_strike, scan_markets
+from bot.strategy_engine import decide_signal
 
 
 # Map Kalshi ticker prefix → underlying symbol used by the price feed.
@@ -115,10 +121,11 @@ _consecutive_price_feed_failures = 0
 
 def run(dry_run: bool) -> None:
     _setup_logging()
+    trading_mode = _resolved_trading_mode(dry_run)
     enabled_underlyings = ",".join(s for s, _ in _enabled_underlyings()) or "NONE"
     log.info(
-        "=== Kalshi Bot starting (dry_run=%s) — v2.1.0 underlyings=[%s] ===",
-        dry_run, enabled_underlyings,
+        "=== Kalshi Bot starting (dry_run=%s trading_mode=%s) — v2.2.0 underlyings=[%s] ===",
+        dry_run, trading_mode, enabled_underlyings,
     )
     log.info(
         "Config: min_edge=%.2f  min_t_hours=%.1f  daily_spend=%.0f%%/floor=$%.0f  "
@@ -153,11 +160,13 @@ def run(dry_run: bool) -> None:
         base_url=cfg.KALSHI_BASE_URL,
     )
 
-    risk = DailyRisk(
+    risk = PortfolioRisk(
         daily_spend_pct=cfg.DAILY_SPEND_PCT,
         daily_spend_floor=cfg.DAILY_SPEND_FLOOR,
         max_contracts_per_market=cfg.MAX_CONTRACTS_PER_MARKET,
         max_positions=cfg.MAX_POSITIONS,
+        max_symbol_daily_spend_pct=cfg.MAX_SYMBOL_DAILY_SPEND_PCT,
+        max_symbol_positions=cfg.MAX_SYMBOL_POSITIONS,
         kelly_fraction=cfg.KELLY_FRACTION,
         max_drawdown_pct=cfg.MAX_DRAWDOWN_PCT,
         bankroll_fraction=cfg.BANKROLL_FRACTION,
@@ -173,6 +182,7 @@ def run(dry_run: bool) -> None:
 
     # Restore today's already-spent from DB (so a restart doesn't reset limits)
     risk._daily_spent = store.get_todays_spend()
+    risk.restore_symbol_spend(store.get_todays_spend_by_symbol())
     log.info("Restored today's spend from DB: $%.2f", risk.daily_spent)
 
     # --- Phase C6: Adaptive vol calibration from settled outcome history ---
@@ -210,20 +220,22 @@ def run(dry_run: bool) -> None:
 
 def _apply_calibration(store: Store) -> None:
     """
-    Query settled order outcomes and nudge VOL_SAFETY_MARGIN up/down by ±5%
-    if the model is systematically mis-calibrated. Clamp to [1.0, 2.5].
+    Log settled-trade calibration bias for visibility.
+
+    We do not mutate VOL_SAFETY_MARGIN here. Settled trade outcomes are a
+    selection-biased sample of only the contracts we chose to trade, and a
+    single global vol nudge moves YES/NO probabilities in different directions
+    across strikes. The market-implied IV/RV margin remains the only automatic
+    volatility calibration mechanism.
     """
     bias = store.get_prob_calibration_bias(min_trades=10, lookback_days=30)
     if bias is None:
         log.info("Calibration: insufficient settled trades — using static VOL_SAFETY_MARGIN=%.3f", cfg.VOL_SAFETY_MARGIN)
         return
-    direction = math.copysign(1.0, bias)
-    new_margin = max(1.0, min(1.5, cfg.VOL_SAFETY_MARGIN * (1.0 + 0.02 * direction)))
     log.info(
-        "Calibration: prob_bias=%.4f → adjusting VOL_SAFETY_MARGIN %.3f → %.3f",
-        bias, cfg.VOL_SAFETY_MARGIN, new_margin,
+        "Calibration: prob_bias=%.4f (informational only; VOL_SAFETY_MARGIN unchanged at %.3f)",
+        bias, cfg.VOL_SAFETY_MARGIN,
     )
-    cfg.VOL_SAFETY_MARGIN = new_margin
 
 
 def _check_fills(kalshi: KalshiClient, store: Store) -> None:
@@ -239,17 +251,90 @@ def _check_fills(kalshi: KalshiClient, store: Store) -> None:
             log.warning("Could not check fill for %s: %s", order_id[:8], e)
 
 
+def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: str) -> None:
+    tickers = store.get_unlabeled_market_tickers(before_iso=before_iso, limit=100)
+    for ticker in tickers:
+        try:
+            market = kalshi.get_historical_market(ticker)
+        except Exception:
+            try:
+                market = kalshi.get_market(ticker).__dict__
+            except Exception as exc:
+                log.debug("Outcome backfill skipped for %s: %s", ticker, exc)
+                continue
+
+        result = str(market.get("result") or "").strip().lower()
+        settlement_value = market.get("settlement_value_dollars")
+        if settlement_value is not None:
+            settlement_value = float(settlement_value)
+        elif result in {"yes", "no"}:
+            settlement_value = 1.0 if result == "yes" else 0.0
+        else:
+            settlement_value = None
+        if settlement_value is None:
+            continue
+        store.upsert_market_outcome(
+            ticker=ticker,
+            result=result or ("yes" if settlement_value >= 0.5 else "no"),
+            settlement_value=settlement_value,
+            close_time=str(market.get("close_time") or ""),
+            settlement_ts=str(market.get("settlement_ts") or market.get("expiration_time") or ""),
+        )
+
+
+def _execute_passive_exit(
+    kalshi: KalshiClient,
+    ticker: str,
+    side: str,
+    quantity: int,
+    passive_price: float,
+    symbol: str,
+) -> list[Order]:
+    if quantity <= 0 or passive_price < 0.01:
+        return []
+    try:
+        entry_spot = get_spot_price(symbol)
+    except Exception:
+        entry_spot = None
+
+    order = kalshi.sell_position(ticker, side, quantity, passive_price)
+    total_wait = max(0, cfg.MAKER_ENTRY_TIMEOUT_SEC)
+    poll = max(1, cfg.STALE_ORDER_POLL_SEC)
+    elapsed = 0
+    current = order
+    while elapsed < total_wait:
+        step = min(poll, total_wait - elapsed)
+        time.sleep(step)
+        elapsed += step
+        try:
+            current = kalshi.get_order(order.order_id)
+        except Exception:
+            current = order
+        if current.fill_count >= quantity:
+            return [current]
+        if entry_spot is not None:
+            try:
+                current_spot = get_spot_price(symbol)
+                drift = abs(current_spot - entry_spot) / entry_spot
+                if drift > cfg.STALE_ORDER_SPOT_MOVE_PCT:
+                    break
+            except Exception:
+                pass
+
+    kalshi.cancel_order(order.order_id)
+    return [current] if current.fill_count > 0 else []
+
+
 def _check_exits(
     kalshi: KalshiClient,
     store: Store,
     positions: list[Position],
-    underlyings: dict[str, UnderlyingState],
-    dry_run: bool,
+    assets: dict[str, AssetSnapshot],
+    trading_mode: str,
+    cycle_id: Optional[str] = None,
 ) -> list[str]:
     """
-    Re-evaluate each open position and exit if the theoretical value has
-    dropped to EXIT_LOSS_TRIGGER (loss exit) or risen to TAKE_PROFIT_TRIGGER
-    (profit exit) of the entry price.
+    Re-evaluate each open position and exit on take-profit, loss, or near-expiry.
 
     Each position's underlying (BTC vs ETH) is detected from its ticker prefix
     and uses that underlying's spot, vol, and drift. Positions on a disabled
@@ -270,10 +355,10 @@ def _check_exits(
             continue
 
         symbol = _symbol_for_ticker(pos.ticker)
-        if symbol is None or symbol not in underlyings:
+        if symbol is None or symbol not in assets:
             log.debug("Exit check: skipping %s (no underlying state)", pos.ticker)
             continue
-        u = underlyings[symbol]
+        asset = assets[symbol]
 
         entry_price_per_contract = pos.cost / pos.quantity
 
@@ -289,102 +374,176 @@ def _check_exits(
             continue  # already expired
 
         T_years = T_hours / 8760.0
-        theo_prob = calc_prob(u.spot, strike, T_years, u.sigma_adjusted, mu=u.mu)
+        theo_prob = calc_prob(asset.spot, strike, T_years, asset.sigma_adjusted, mu=asset.mu)
         current_value = theo_prob if pos.side == "yes" else (1.0 - theo_prob)
-
-        loss_trigger_hit = current_value < entry_price_per_contract * cfg.EXIT_LOSS_TRIGGER
-        # Take-profit: only fire if the position has appreciated meaningfully AND
-        # there's enough time left for the gain to evaporate (otherwise just hold to expiry).
+        current_bid = market.yes_bid if pos.side == "yes" else market.no_bid
+        current_ask = market.yes_ask if pos.side == "yes" else market.no_ask
+        liquidation_edge = current_value - current_bid - cfg.KALSHI_TAKER_FEE
+        near_expiry = T_hours < (20.0 / 60.0)
         take_profit_hit = (
-            current_value >= entry_price_per_contract * cfg.TAKE_PROFIT_TRIGGER
+            current_value >= (cfg.TAKE_PROFIT_TRIGGER * entry_price_per_contract)
             and T_hours >= cfg.TAKE_PROFIT_MIN_HOURS
+            and liquidation_edge >= 0.0
         )
 
-        if loss_trigger_hit or take_profit_hit:
-            current_bid = market.yes_bid if pos.side == "yes" else market.no_bid
-            reason = "LOSS" if loss_trigger_hit else "PROFIT"
-            log_fn = log.warning if loss_trigger_hit else log.info
+        loss_trigger_hit = liquidation_edge < -0.02
+        force_exit_hit = near_expiry and liquidation_edge <= 0
+
+        if take_profit_hit or loss_trigger_hit or force_exit_hit:
+            if take_profit_hit:
+                reason = "TAKE_PROFIT"
+                log_fn = log.info
+            elif loss_trigger_hit:
+                reason = "LOSS"
+                log_fn = log.warning
+            else:
+                reason = "FORCE"
+                log_fn = log.info
             log_fn(
-                "%s EXIT %s %s: current_value=%.4f vs entry=%.4f (%.0f%% of entry)  "
-                "bid=%.4f  T=%.2fh  [%s]",
+                "%s EXIT %s %s: current_value=%.4f vs entry=%.4f  bid=%.4f  "
+                "liq_edge=%.4f  T=%.2fh  [%s]",
                 reason, pos.ticker, pos.side, current_value, entry_price_per_contract,
-                (current_value / entry_price_per_contract) * 100,
-                current_bid, T_hours, "DRY RUN" if dry_run else "EXECUTING",
+                current_bid, liquidation_edge, T_hours, trading_mode.upper(),
             )
 
-            if not dry_run and current_bid >= 0.01:
+            if trading_mode == "live" and (current_bid >= 0.01 or current_ask >= 0.01):
                 try:
-                    sell_price = max(0.01, current_bid)
-                    order = kalshi.sell_position(pos.ticker, pos.side, pos.quantity, sell_price)
-                    store.log_order(
-                        order,
-                        theo_prob=theo_prob,
-                        gross_edge=current_value - sell_price,
-                        edge=current_value - sell_price - cfg.KALSHI_TAKER_FEE,
-                        fee=cfg.KALSHI_TAKER_FEE,
-                        hours_to_expiry=T_hours,
-                    )
-                    exited_tickers.append(pos.ticker)
+                    passive_exit = take_profit_hit or not near_expiry
+                    sell_price = max(0.01, current_ask if passive_exit else current_bid)
+                    if passive_exit:
+                        orders = _execute_passive_exit(
+                            kalshi,
+                            pos.ticker,
+                            pos.side,
+                            pos.quantity,
+                            sell_price,
+                            symbol,
+                        )
+                    else:
+                        orders = [kalshi.sell_position(pos.ticker, pos.side, pos.quantity, sell_price)]
+                    total_filled = sum(order.fill_count for order in orders)
+                    total_cost = sum(order.taker_fill_cost for order in orders)
+                    for order in orders:
+                        store.log_order(
+                            order,
+                            theo_prob=theo_prob,
+                            gross_edge=current_value - sell_price,
+                            edge=current_value - sell_price - cfg.KALSHI_TAKER_FEE,
+                            fee=cfg.KALSHI_TAKER_FEE,
+                            hours_to_expiry=T_hours,
+                        )
+                    if cycle_id:
+                        store.log_execution_attempt(
+                            cycle_id=cycle_id,
+                            symbol=symbol,
+                            ticker=pos.ticker,
+                            side=pos.side,
+                            trading_mode=trading_mode,
+                            requested_contracts=pos.quantity,
+                            filled_contracts=total_filled,
+                            ask_price=sell_price,
+                            mid_price=sell_price,
+                            estimated_cost=sell_price * pos.quantity,
+                            actual_cost=total_cost,
+                            status="exit",
+                            reason=reason.lower(),
+                        )
+                    if total_filled > 0:
+                        exited_tickers.append(pos.ticker)
                     alert(
                         f"{reason} exit: {pos.ticker} {pos.side} x{pos.quantity} "
                         f"@ ${sell_price:.2f} (value {current_value:.2%} of entry)",
-                        level="WARNING" if loss_trigger_hit else "INFO",
+                        level="WARNING",
                     )
                 except Exception as e:
                     log.error("Exit order failed for %s: %s", pos.ticker, e)
-            elif dry_run:
-                exited_tickers.append(pos.ticker)  # simulate exit in dry-run
+            else:
+                if cycle_id:
+                    store.log_execution_attempt(
+                        cycle_id=cycle_id,
+                        symbol=symbol,
+                        ticker=pos.ticker,
+                        side=pos.side,
+                        trading_mode=trading_mode,
+                        requested_contracts=pos.quantity,
+                        filled_contracts=0,
+                        ask_price=current_bid,
+                        mid_price=current_bid,
+                        estimated_cost=current_bid * pos.quantity,
+                        actual_cost=0.0,
+                        status="exit_skipped",
+                        reason=f"{reason.lower()}_{trading_mode}",
+                    )
+                exited_tickers.append(pos.ticker)
 
     return exited_tickers
 
 
-def _wait_for_fill(
+def _resolved_trading_mode(dry_run: bool) -> str:
+    if dry_run:
+        return "observe"
+    if cfg.TRADING_MODE not in {"live", "paper", "observe"}:
+        return "observe"
+    return cfg.TRADING_MODE
+
+
+def _positions_by_symbol(positions: list[Position]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for pos in positions:
+        symbol = _symbol_for_ticker(pos.ticker)
+        if symbol:
+            counts[symbol] += 1
+    return dict(counts)
+
+
+def _build_cycle_assets(
     kalshi: KalshiClient,
-    order: Order,
-    contracts: int,
-    timeout_sec: int,
-    symbol: str,
-    entry_spot: Optional[float],
-    phase_label: str,
-) -> tuple[Order, bool]:
-    """
-    Poll an open limit order until it fills, times out, or spot drifts too far.
-
-    Returns (updated_order, spot_moved).
-    """
-    poll = max(1, cfg.STALE_ORDER_POLL_SEC)
-    elapsed = 0
-    spot_moved = False
-
-    while elapsed < timeout_sec:
-        step = min(poll, timeout_sec - elapsed)
-        time.sleep(step)
-        elapsed += step
-
+    store: Store,
+    open_positions_by_symbol: dict[str, int],
+) -> tuple[dict[str, AssetSnapshot], dict[str, list], int]:
+    assets: dict[str, AssetSnapshot] = {}
+    features_by_symbol: dict[str, list] = {}
+    total_markets = 0
+    for symbol, series in _enabled_underlyings():
         try:
-            order = kalshi.get_order(order.order_id)
-        except Exception:
-            pass
-
-        if order.fill_count >= contracts:
-            log.info("%s: fully filled %d/%d (after %ds)", phase_label, order.fill_count, contracts, elapsed)
-            return order, False
-
-        if entry_spot is not None:
-            try:
-                current_spot = get_spot_price(symbol)
-                drift = abs(current_spot - entry_spot) / entry_spot
-                if drift > cfg.STALE_ORDER_SPOT_MOVE_PCT:
-                    log.warning(
-                        "%s spot moved %.3f%% (%.0f → %.0f) during %s — cancelling",
-                        symbol, drift * 100, entry_spot, current_spot, phase_label,
-                    )
-                    spot_moved = True
-                    break
-            except Exception as e:
-                log.debug("Spot poll failed: %s", e)
-
-    return order, spot_moved
+            price_result = fetch_price_snapshot(
+                symbol=symbol,
+                short_days=cfg.VOL_SHORT_DAYS,
+                long_days=cfg.VOL_LONG_DAYS,
+                drift_days=cfg.DRIFT_LOOKBACK_DAYS,
+            )
+            markets_result = fetch_markets_snapshot(kalshi, symbol, series)
+            if cfg.ENABLE_DERIBIT_IV:
+                iv_result = fetch_deribit_iv_snapshot(symbol, price_result.spot, cfg.DERIBIT_MIN_DTE_HOURS)
+            else:
+                from bot.models import SourceSnapshot
+                iv_result = type("DeribitIVResult", (), {
+                    "source": SourceSnapshot(
+                        provider="deribit",
+                        symbol=symbol,
+                        fetched_at=datetime.now(timezone.utc).isoformat(),
+                        freshness_sec=0.0,
+                        status="disabled",
+                        payload_hash="disabled",
+                    ),
+                    "iv": None,
+                })()
+            asset = build_asset_snapshot(
+                symbol=symbol,
+                series_ticker=series,
+                price_result=price_result,
+                markets_result=markets_result,
+                iv_result=iv_result,
+                store=store,
+                open_positions=open_positions_by_symbol.get(symbol, 0),
+            )
+            assets[symbol] = asset
+            features = build_market_features(asset, markets_result.markets, fee=cfg.KALSHI_TAKER_FEE)
+            features_by_symbol[symbol] = features
+            total_markets += len(markets_result.markets)
+        except Exception as e:
+            log.error("Cycle build failed for %s: %s", symbol, e)
+    return assets, features_by_symbol, total_markets
 
 
 def _execute_with_price_improvement(
@@ -394,87 +553,95 @@ def _execute_with_price_improvement(
     contracts: int,
     ask_price: float,
     mid_price: float,
-    bid_price: float,
-    dry_run: bool,
+    bid_price: float = 0.0,
+    dry_run: bool = False,
     symbol: str = "BTC",
 ) -> list[Order]:
     """
-    Three-phase fill strategy (best price → acceptable → immediate):
-
-    Phase 0 — Maker bid (ENABLE_MAKER_ORDERS): post at bid_price, $0 taker fee.
-               Kalshi charges maker $0; posting below ask rests in the book.
-    Phase 1 — Mid-price (ENABLE_PRICE_IMPROVEMENT): post at mid, reduced fee.
-    Phase 2 — Ask fallback: immediate taker fill at ask.
-
-    Each phase cancels any unfilled remainder before escalating.
-    If spot moves > STALE_ORDER_SPOT_MOVE_PCT during any wait, abort entirely.
-
-    Returns list of Orders with fills. Callers sum taker_fill_cost for accounting.
+    Maker-first entry: post at the live market bid with post_only=True and
+    cancel rather than cross the book. Uses MAKER_ENTRY_TIMEOUT_SEC to wait
+    for a passive fill before giving up.
     """
+    passive_price = max(0.01, min(0.99, mid_price if mid_price < ask_price else ask_price - 0.01))
+    if passive_price <= 0:
+        return []
+
+    try:
+        entry_market = kalshi.get_market(ticker)
+        passive_price = entry_market.yes_bid if side == "yes" else entry_market.no_bid
+    except Exception:
+        pass
+    passive_price = max(0.01, min(0.99, passive_price))
+
+    if not cfg.ENABLE_PRICE_IMPROVEMENT:
+        order = kalshi.place_order(ticker, side, contracts, passive_price, post_only=True)
+        return [order] if order is not None else []
+
     try:
         entry_spot = get_spot_price(symbol)
     except Exception as e:
-        log.debug("Spot snapshot failed: %s", e)
+        log.debug("Spot snapshot before maker-first order failed: %s", e)
         entry_spot = None
 
-    filled_orders: list[Order] = []
-    remaining = contracts
+    try:
+        order1 = kalshi.place_order(ticker, side, contracts, passive_price, post_only=True)
+        log.info("Maker-first entry: placed %d @ passive=%.3f (ask=%.3f)", contracts, passive_price, ask_price)
+    except Exception as e:
+        log.warning("Maker-first order failed for %s: %s", ticker, e)
+        return []
 
-    # --- Phase 0: Maker bid ($0 fee) ---
-    if cfg.ENABLE_MAKER_ORDERS and bid_price > 0.01 and bid_price < ask_price:
+    total_wait = max(0, cfg.MAKER_ENTRY_TIMEOUT_SEC)
+    poll = max(1, cfg.STALE_ORDER_POLL_SEC)
+    spot_moved = False
+    book_deteriorated = False
+    elapsed = 0
+
+    while elapsed < total_wait:
+        step = min(poll, total_wait - elapsed)
+        time.sleep(step)
+        elapsed += step
+
         try:
-            maker_order = kalshi.place_order(ticker, side, remaining, bid_price)
-            log.info(
-                "Maker bid: placed %d @ bid=%.3f (mid=%.3f ask=%.3f)",
-                remaining, bid_price, mid_price, ask_price,
-            )
-            maker_order, spot_moved = _wait_for_fill(
-                kalshi, maker_order, remaining,
-                cfg.MAKER_ORDER_TIMEOUT_SEC, symbol, entry_spot, "maker-bid",
-            )
-            if maker_order.fill_count > 0:
-                filled_orders.append(maker_order)
-                remaining -= maker_order.fill_count
-            if remaining > 0:
-                kalshi.cancel_order(maker_order.order_id)
-            if spot_moved or remaining <= 0:
-                return filled_orders
-        except Exception as e:
-            log.warning("Maker bid order failed, continuing to mid: %s", e)
+            order1 = kalshi.get_order(order1.order_id)
+        except Exception:
+            pass
 
-    # --- Phase 1: Mid-price ---
-    if remaining > 0 and cfg.ENABLE_PRICE_IMPROVEMENT and mid_price > 0.01 and mid_price < ask_price:
+        if order1.fill_count >= contracts:
+            log.info("Maker-first entry: fully filled %d/%d after %ds", order1.fill_count, contracts, elapsed)
+            return [order1]
+
+        if entry_spot is not None:
+            try:
+                current_spot = get_spot_price(symbol)
+                drift = abs(current_spot - entry_spot) / entry_spot
+                if drift > cfg.STALE_ORDER_SPOT_MOVE_PCT:
+                    log.warning(
+                        "%s spot moved %.3f%% (%.0f → %.0f) during maker wait — cancelling %s",
+                        symbol, drift * 100, entry_spot, current_spot, order1.order_id[:8],
+                    )
+                    spot_moved = True
+                    break
+            except Exception as e:
+                log.debug("Spot price poll failed: %s", e)
+
         try:
-            mid_order = kalshi.place_order(ticker, side, remaining, mid_price)
-            log.info(
-                "Mid-price: placed %d @ mid=%.3f (ask=%.3f)",
-                remaining, mid_price, ask_price,
-            )
-            mid_order, spot_moved = _wait_for_fill(
-                kalshi, mid_order, remaining,
-                cfg.PRICE_IMPROVEMENT_TIMEOUT_SEC, symbol, entry_spot, "mid-price",
-            )
-            if mid_order.fill_count > 0:
-                filled_orders.append(mid_order)
-                remaining -= mid_order.fill_count
-            if remaining > 0:
-                kalshi.cancel_order(mid_order.order_id)
-            if spot_moved or remaining <= 0:
-                return filled_orders
-        except Exception as e:
-            log.warning("Mid-price order failed, falling back to ask: %s", e)
+            market = kalshi.get_market(ticker)
+            current_bid = market.yes_bid if side == "yes" else market.no_bid
+            current_ask = market.yes_ask if side == "yes" else market.no_ask
+            if current_bid + 1e-9 < passive_price or current_ask > ask_price + cfg.MAX_DEPTH_SLIPPAGE_PER_CONTRACT:
+                book_deteriorated = True
+                break
+        except Exception:
+            pass
 
-    # --- Phase 2: Ask fallback (immediate taker fill) ---
-    if remaining > 0:
-        try:
-            ask_order = kalshi.place_order(ticker, side, remaining, ask_price)
-            if ask_order is not None:
-                filled_orders.append(ask_order)
-                log.info("Ask fallback: placed %d @ ask=%.3f", remaining, ask_price)
-        except Exception as e:
-            log.error("Ask fallback order failed for %s: %s", ticker, e)
-
-    return filled_orders
+    filled = order1.fill_count
+    kalshi.cancel_order(order1.order_id)
+    if spot_moved or book_deteriorated:
+        log.info(
+            "Maker-first entry canceled for %s: spot_moved=%s book_deteriorated=%s",
+            ticker, spot_moved, book_deteriorated,
+        )
+    return [order1] if filled > 0 else []
 
 
 def _enabled_underlyings() -> list[tuple[str, str]]:
@@ -593,6 +760,8 @@ def _build_underlying_state(
 
 def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: bool) -> None:
     global _consecutive_price_feed_failures
+    trading_mode = _resolved_trading_mode(dry_run)
+    cycle_id = datetime.now(timezone.utc).isoformat()
     log.info("--- Cycle start ---")
     orders_placed = 0
 
@@ -600,24 +769,6 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     if not enabled:
         log.error("No underlyings enabled — set ENABLE_BTC and/or ENABLE_ETH")
         return
-
-    # --- Build per-underlying state ---
-    underlyings: dict[str, UnderlyingState] = {}
-    for symbol, series in enabled:
-        state = _build_underlying_state(kalshi, symbol, series, store)
-        if state is not None:
-            underlyings[symbol] = state
-
-    if not underlyings:
-        _consecutive_price_feed_failures += 1
-        log.error("No underlyings produced usable state this cycle")
-        if _consecutive_price_feed_failures >= 3:
-            alert(
-                f"All underlyings failed for {_consecutive_price_feed_failures} consecutive cycles",
-                level="ERROR",
-            )
-        return
-    _consecutive_price_feed_failures = 0
 
     # --- Account-level fetches (positions, balance) ---
     try:
@@ -630,6 +781,25 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
 
     # --- Set session balance for drawdown tracking ---
     risk.set_session_balance(balance)
+    open_positions_by_symbol = _positions_by_symbol(positions)
+
+    assets, features_by_symbol, total_markets = _build_cycle_assets(kalshi, store, open_positions_by_symbol)
+    for asset in assets.values():
+        store.log_asset_run(cycle_id, asset)
+    for features in features_by_symbol.values():
+        for feature in features:
+            store.log_market_snapshot(cycle_id, feature)
+
+    if not assets:
+        _consecutive_price_feed_failures += 1
+        log.error("No underlyings produced usable state this cycle")
+        if _consecutive_price_feed_failures == 3 or _consecutive_price_feed_failures % 10 == 0:
+            alert(
+                f"All underlyings failed for {_consecutive_price_feed_failures} consecutive cycles",
+                level="ERROR",
+            )
+        return
+    _consecutive_price_feed_failures = 0
 
     # --- Empirical slippage adjustment ---
     slippage_factor = store.get_slippage_factor(
@@ -639,8 +809,6 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     risk.set_slippage_factor(slippage_factor)
     if slippage_factor is not None:
         log.info("Empirical slippage factor: %.2f", slippage_factor)
-
-    total_markets = sum(len(u.markets) for u in underlyings.values())
 
     # --- Drawdown guard ---
     already_halted = risk.drawdown_halted
@@ -658,130 +826,244 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
             )
         store.snapshot_daily(balance, risk.daily_spent, len(positions))
         # Log the runs row using BTC's stats if available, else first underlying.
-        primary = underlyings.get("BTC") or next(iter(underlyings.values()))
+        primary = assets.get("BTC") or next(iter(assets.values()))
         store.log_run(
             btc_price=primary.spot, sigma_short=primary.sigma_short, sigma_long=primary.sigma_long,
             markets_scanned=total_markets, signals_found=0, orders_placed=0,
-            dry_run=dry_run, iv_rv_ratio=primary.iv_rv_ratio,
+            dry_run=trading_mode != "live", iv_rv_ratio=primary.iv_rv_ratio,
             adaptive_safety_margin=primary.adaptive_margin,
+            cycle_id=cycle_id,
         )
         return
 
     # --- Fill quality check ---
     _check_fills(kalshi, store)
+    _backfill_market_outcomes(kalshi, store, before_iso=cycle_id)
 
     # --- Position exit check (loss + take-profit, routed by underlying) ---
-    exited_tickers = _check_exits(kalshi, store, positions, underlyings, dry_run)
+    exited_tickers = _check_exits(kalshi, store, positions, assets, trading_mode, cycle_id=cycle_id)
     if exited_tickers:
-        try:
-            positions = kalshi.get_positions()
-            balance = kalshi.get_balance()
-        except Exception:
-            pass  # use stale data; exits already logged
+        if trading_mode == "live":
+            try:
+                positions = kalshi.get_positions()
+                balance = kalshi.get_balance()
+            except Exception:
+                pass  # use stale data; exits already logged
+        else:
+            positions = [p for p in positions if p.ticker not in set(exited_tickers)]
+        open_positions_by_symbol = _positions_by_symbol(positions)
 
     held_tickers = {p.ticker for p in positions}
     open_count = len(positions)
 
     # --- Signal scan across all underlyings ---
-    all_signals: list[tuple[Signal, UnderlyingState]] = []
-    for u in underlyings.values():
-        sigs = scan_markets(
-            markets=u.markets,
-            spot_price=u.spot,
-            sigma=u.sigma_adjusted,
-            min_edge=cfg.MIN_EDGE,
-            min_t_hours=cfg.MIN_T_HOURS,
-            held_tickers=held_tickers,
-            fee=cfg.KALSHI_TAKER_FEE,
-            max_bid_ask_spread=cfg.MAX_BID_ASK_SPREAD,
-            max_bid_ask_pct_spread=cfg.MAX_BID_ASK_PCT_SPREAD,
-            max_last_price_divergence=cfg.MAX_LAST_PRICE_DIVERGENCE,
-            mu=u.mu,
-        )
-        for s in sigs:
-            all_signals.append((s, u))
+    all_decisions = []
+    reject_counts: Counter[str] = Counter()
+    for symbol, asset in assets.items():
+        for feature in features_by_symbol.get(symbol, []):
+            decision = decide_signal(
+                store,
+                asset,
+                feature,
+                held_tickers,
+                before_iso=cycle_id,
+                trading_mode=trading_mode,
+            )
+            store.log_signal_decision(cycle_id, decision)
+            all_decisions.append(decision)
+            if not decision.eligible:
+                reject_counts[decision.reject_reason] += 1
 
-    # Combine and sort across underlyings by net edge (best opportunities first).
-    all_signals.sort(key=lambda pair: pair[0].edge, reverse=True)
+    eligible_decisions = sorted(
+        [d for d in all_decisions if d.eligible],
+        key=lambda d: d.score,
+        reverse=True,
+    )
     log.info(
-        "Combined signals: %d across %d underlying(s) (%s)",
-        len(all_signals), len(underlyings),
-        ",".join(sorted(underlyings)),
+        "Combined signals: %d eligible / %d total across %d underlying(s) (%s)%s",
+        len(eligible_decisions), len(all_decisions), len(assets),
+        ",".join(sorted(assets)),
+        f" rejects={dict(reject_counts)}" if reject_counts else "",
     )
 
     # --- Order placement ---
-    for sig, u in all_signals:
-        if not risk.can_trade(open_count):
+    for decision in eligible_decisions:
+        if not risk.can_trade_symbol(decision.symbol, open_positions_by_symbol):
             break
 
-        contracts = risk.size_order(sig, current_balance=balance, open_positions=open_count)
+        contracts = risk.size_order(
+            decision,
+            current_balance=balance,
+            open_positions_by_symbol=open_positions_by_symbol,
+        )
         if contracts < 1:
-            log.info("Signal %s %s: sized to 0 contracts, skipping", sig.ticker, sig.side)
+            store.log_execution_attempt(
+                cycle_id=cycle_id,
+                symbol=decision.symbol,
+                ticker=decision.ticker,
+                side=decision.side,
+                trading_mode=trading_mode,
+                requested_contracts=0,
+                filled_contracts=0,
+                ask_price=decision.ask,
+                mid_price=decision.mid_price,
+                estimated_cost=0.0,
+                actual_cost=0.0,
+                status="skipped",
+                reason=risk.last_size_reason or "size_zero",
+            )
+            log.info("Signal %s %s: sized to 0 contracts, skipping", decision.ticker, decision.side)
             continue
 
-        cost_estimate = contracts * sig.price
+        cost_estimate = contracts * decision.ask
         log.info(
-            "SIGNAL [%s] %s %s: theo=%.4f ask=%.2f mid=%.2f gross_edge=%.4f net_edge=%.4f fee=%.2f  "
+            "SIGNAL [%s] %s %s: theo=%.4f ask=%.2f mid=%.2f gross_edge=%.4f net_edge=%.4f "
+            "required=%.4f score=%.4f proxy=%.4f depth_slip=%.4f fee=%.2f  "
             "→  %d contracts (~$%.2f)  balance=$%.2f%s",
-            u.symbol, sig.ticker, sig.side, sig.theo_prob, sig.price, sig.mid_price,
-            sig.gross_edge, sig.edge, sig.fee,
-            contracts, cost_estimate, balance, "  [DRY RUN]" if dry_run else "",
+            decision.symbol, decision.ticker, decision.side, decision.theo_prob, decision.ask, decision.mid_price,
+            decision.gross_edge, decision.edge, decision.required_edge, decision.score,
+            decision.realized_edge_proxy, decision.depth_slippage, decision.fee,
+            contracts, cost_estimate, balance, "  [SIMULATED]" if trading_mode != "live" else "",
         )
 
-        if dry_run:
+        if trading_mode == "observe":
+            store.log_execution_attempt(
+                cycle_id=cycle_id,
+                symbol=decision.symbol,
+                ticker=decision.ticker,
+                side=decision.side,
+                trading_mode=trading_mode,
+                requested_contracts=contracts,
+                filled_contracts=0,
+                ask_price=decision.ask,
+                mid_price=decision.mid_price,
+                estimated_cost=cost_estimate,
+                actual_cost=0.0,
+                status="observe",
+                reason="observe_mode",
+            )
+            continue
+        if trading_mode == "paper":
+            risk.record_fill(cost_estimate, decision.symbol)
+            balance -= cost_estimate
+            open_positions_by_symbol[decision.symbol] = open_positions_by_symbol.get(decision.symbol, 0) + 1
+            open_count += 1
+            orders_placed += 1
+            store.log_execution_attempt(
+                cycle_id=cycle_id,
+                symbol=decision.symbol,
+                ticker=decision.ticker,
+                side=decision.side,
+                trading_mode=trading_mode,
+                requested_contracts=contracts,
+                filled_contracts=contracts,
+                ask_price=decision.ask,
+                mid_price=decision.mid_price,
+                estimated_cost=cost_estimate,
+                actual_cost=cost_estimate,
+                status="paper_fill",
+                reason="paper_mode",
+            )
             continue
 
         try:
             orders = _execute_with_price_improvement(
                 kalshi=kalshi,
-                ticker=sig.ticker,
-                side=sig.side,
+                ticker=decision.ticker,
+                side=decision.side,
                 contracts=contracts,
-                ask_price=sig.price,
-                mid_price=sig.mid_price,
-                bid_price=sig.bid_price,
-                dry_run=dry_run,
-                symbol=u.symbol,
+                ask_price=decision.ask,
+                mid_price=decision.mid_price,
+                bid_price=getattr(decision, "bid_price", 0.0),
+                dry_run=False,
+                symbol=decision.symbol,
             )
             if not orders:
-                log.warning("Order execution returned no fill for %s", sig.ticker)
+                store.log_execution_attempt(
+                    cycle_id=cycle_id,
+                    symbol=decision.symbol,
+                    ticker=decision.ticker,
+                    side=decision.side,
+                    trading_mode=trading_mode,
+                    requested_contracts=contracts,
+                    filled_contracts=0,
+                    ask_price=decision.ask,
+                    mid_price=decision.mid_price,
+                    estimated_cost=cost_estimate,
+                    actual_cost=0.0,
+                    status="no_fill",
+                    reason="execution_no_fill",
+                )
+                log.warning("Order execution returned no fill for %s", decision.ticker)
                 continue
 
             total_filled = sum(o.fill_count for o in orders)
             total_cost = sum(o.taker_fill_cost for o in orders)
             fill_cost = total_cost if total_cost > 0 else cost_estimate
-            risk.record_fill(fill_cost)
+            risk.record_fill(fill_cost, decision.symbol)
             balance -= fill_cost
             for o in orders:
                 store.log_order(
                     o,
-                    theo_prob=sig.theo_prob,
-                    gross_edge=sig.gross_edge,
-                    edge=sig.edge,
-                    fee=sig.fee,
-                    hours_to_expiry=sig.hours_to_expiry,
+                    theo_prob=decision.theo_prob,
+                    gross_edge=decision.gross_edge,
+                    edge=decision.edge,
+                    fee=decision.fee,
+                    hours_to_expiry=decision.hours_to_expiry,
                 )
+            store.log_execution_attempt(
+                cycle_id=cycle_id,
+                symbol=decision.symbol,
+                ticker=decision.ticker,
+                side=decision.side,
+                trading_mode=trading_mode,
+                requested_contracts=contracts,
+                filled_contracts=total_filled,
+                ask_price=decision.ask,
+                mid_price=decision.mid_price,
+                estimated_cost=cost_estimate,
+                actual_cost=fill_cost,
+                status="live_fill" if total_filled > 0 else "live_no_fill",
+                reason="live_execution",
+            )
             if total_filled > 0:
+                open_positions_by_symbol[decision.symbol] = open_positions_by_symbol.get(decision.symbol, 0) + 1
                 open_count += 1
                 orders_placed += 1
             time.sleep(0.5)  # avoid burst rate-limiting between orders
         except Exception as e:
-            log.error("Order failed for %s: %s", sig.ticker, e)
+            store.log_execution_attempt(
+                cycle_id=cycle_id,
+                symbol=decision.symbol,
+                ticker=decision.ticker,
+                side=decision.side,
+                trading_mode=trading_mode,
+                requested_contracts=contracts,
+                filled_contracts=0,
+                ask_price=decision.ask,
+                mid_price=decision.mid_price,
+                estimated_cost=cost_estimate,
+                actual_cost=0.0,
+                status="error",
+                reason=str(e),
+            )
+            log.error("Order failed for %s: %s", decision.ticker, e)
 
     store.snapshot_daily(balance, risk.daily_spent, open_count)
 
     # Persist a single runs row anchored on BTC (or the first available underlying).
-    primary = underlyings.get("BTC") or next(iter(underlyings.values()))
+    primary = assets.get("BTC") or next(iter(assets.values()))
     store.log_run(
         btc_price=primary.spot,
         sigma_short=primary.sigma_short,
         sigma_long=primary.sigma_long,
         markets_scanned=total_markets,
-        signals_found=len(all_signals),
+        signals_found=len(eligible_decisions),
         orders_placed=orders_placed,
-        dry_run=dry_run,
+        dry_run=trading_mode != "live",
         iv_rv_ratio=primary.iv_rv_ratio,
         adaptive_safety_margin=primary.adaptive_margin,
+        cycle_id=cycle_id,
     )
 
     try:
@@ -790,7 +1072,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     except Exception as e:
         log.warning("Daily report generation failed: %s", e)
 
-    log.info("--- Cycle end: %d signal(s), %d order(s) placed ---", len(all_signals), orders_placed)
+    log.info("--- Cycle end: %d eligible signal(s), %d order(s) placed ---", len(eligible_decisions), orders_placed)
 
 
 # ------------------------------------------------------------------

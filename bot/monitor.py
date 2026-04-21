@@ -9,10 +9,17 @@ Usage:
     alert("Drawdown limit reached — halting trading", level="WARNING")
 """
 import logging
+import time
+
 import requests
 import bot.config as cfg
 
 log = logging.getLogger(__name__)
+_last_sent_at: dict[tuple[str, str], float] = {}
+
+
+def _webhook_numeric_level(level: str) -> int:
+    return getattr(logging, level.upper(), logging.ERROR)
 
 
 def alert(message: str, level: str = "ERROR") -> None:
@@ -28,6 +35,15 @@ def alert(message: str, level: str = "ERROR") -> None:
 
     if not cfg.ALERT_WEBHOOK_URL:
         return
+    if numeric_level < _webhook_numeric_level(cfg.ALERT_WEBHOOK_MIN_LEVEL):
+        return
+
+    dedup_key = (level.upper(), message)
+    now = time.time()
+    last_sent = _last_sent_at.get(dedup_key)
+    if last_sent is not None and (now - last_sent) < max(0, cfg.ALERT_DEDUP_SECONDS):
+        log.debug("Suppressing duplicate webhook alert: %s", message)
+        return
 
     # Discord uses "content"; Slack uses "text"
     url = cfg.ALERT_WEBHOOK_URL
@@ -38,5 +54,6 @@ def alert(message: str, level: str = "ERROR") -> None:
     try:
         resp = requests.post(cfg.ALERT_WEBHOOK_URL, json=payload, timeout=5)
         resp.raise_for_status()
+        _last_sent_at[dedup_key] = now
     except Exception as e:
         log.warning("Alert webhook delivery failed: %s", e)
