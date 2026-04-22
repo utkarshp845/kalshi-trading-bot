@@ -72,3 +72,25 @@ class TestMoneyParsing:
         assert yes_asks[0].quantity == 10.0
         assert yes_asks[1].price == pytest.approx(0.46)
         assert snapshot.entry_metrics("yes", 0.45)["cumulative_size_at_entry"] == 10.0
+
+    def test_get_market_orderbooks_passes_tickers_as_list(self):
+        client = object.__new__(KalshiClient)
+        captured = {}
+
+        def _get(_path, params=None):
+            captured["params"] = params
+            return {"orderbooks": []}
+
+        client._get = _get
+
+        result = client.get_market_orderbooks(
+            ["KXBTC-26APR4PM-B95000", "KXBTC-26APR4PM-B96000"],
+            depth=20,
+        )
+
+        assert result == {}
+        assert captured["params"]["tickers"] == [
+            "KXBTC-26APR4PM-B95000",
+            "KXBTC-26APR4PM-B96000",
+        ]
+        assert captured["params"]["depth"] == 20

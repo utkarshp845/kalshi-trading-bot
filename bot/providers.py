@@ -100,7 +100,23 @@ def fetch_deribit_iv_snapshot(symbol: str, spot: float, min_dte_hours: float) ->
 def fetch_markets_snapshot(kalshi: KalshiClient, symbol: str, series_ticker: str) -> MarketsResult:
     fetched_at = _now()
     markets = kalshi.get_open_markets(series_ticker)
-    orderbooks = kalshi.get_market_orderbooks([m.ticker for m in markets], depth=cfg.ORDERBOOK_DEPTH)
+    try:
+        orderbooks = kalshi.get_market_orderbooks([m.ticker for m in markets], depth=cfg.ORDERBOOK_DEPTH)
+    except Exception as e:
+        # Orderbook depth enriches sizing and liquidity checks, but a transient
+        # failure here should not make the entire underlying unusable.
+        orderbooks = {}
+        if markets:
+            fallback_tickers = ",".join(m.ticker for m in markets[:3])
+            if len(markets) > 3:
+                fallback_tickers += ",..."
+        else:
+            fallback_tickers = "<none>"
+        from logging import getLogger
+        getLogger(__name__).warning(
+            "Batch orderbook fetch failed for %s (%s): %s",
+            symbol, fallback_tickers, e,
+        )
     markets = [replace(m, orderbook=orderbooks.get(m.ticker)) for m in markets]
     payload = {
         "tickers": [m.ticker for m in markets],

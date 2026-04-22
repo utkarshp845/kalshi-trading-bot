@@ -285,7 +285,10 @@ class KalshiClient:
         if not tickers:
             return {}
         path = "/markets/orderbooks"
-        data = self._get(path, params={"tickers": ",".join(tickers), "depth": depth})
+        # Kalshi documents `tickers` as a string[] query param. Passing the raw
+        # list lets `requests` encode repeated `tickers=` keys instead of relying
+        # on undocumented CSV parsing.
+        data = self._get(path, params={"tickers": tickers, "depth": depth})
         out: dict[str, OrderbookSnapshot] = {}
         for item in data.get("orderbooks", []):
             ticker = item.get("ticker", "")
