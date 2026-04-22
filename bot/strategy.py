@@ -26,10 +26,10 @@ _STRIKE_RE = re.compile(r"-B(\d+)$", re.IGNORECASE)
 class Signal:
     ticker: str
     side: str         # "yes" (buy YES) or "no" (buy NO)
-    price: float      # ask price to pay (dollars)
-    gross_edge: float # edge before fees
-    edge: float       # net edge after taker fee
-    fee: float        # taker fee deducted (dollars per contract)
+    price: float      # ask price (reference; actual fill is bid for maker entries)
+    gross_edge: float # edge before fees (theo - entry_price)
+    edge: float       # net edge after fee (fee=0 for maker entries)
+    fee: float        # fee paid per contract (0 for maker, taker_fee otherwise)
     theo_prob: float  # fair value of the selected contract side
     strike: float
     mid_price: float = 0.0      # bid-ask midpoint for price-improvement orders
@@ -67,6 +67,7 @@ def evaluate(
     max_bid_ask_pct_spread: float = 0.30,
     max_last_price_divergence: float = 0.15,
     mu: float = 0.0,
+    maker_entry: bool = False,
 ) -> tuple[Optional["Signal"], str]:
     """
     Evaluate one Kalshi market and return a Signal if an edge exists, else None.
@@ -77,8 +78,9 @@ def evaluate(
         sigma:              Annualized realized volatility (already safety-margin adjusted)
         min_edge:           Minimum NET edge threshold to act (e.g. 0.15)
         min_t_hours:        Skip markets expiring sooner than this (e.g. 1.0)
-        fee:                Taker fee in dollars per contract (deducted from edge)
+        fee:                Taker fee in dollars per contract (ignored when maker_entry=True)
         max_bid_ask_spread: Skip markets with bid-ask spread wider than this
+        maker_entry:        If True, compute edge at bid price with $0 fee (maker order semantics)
     """
     strike = _parse_strike(market.ticker)
     if strike is None:
@@ -120,12 +122,20 @@ def evaluate(
     yes_theo_prob = calc_prob(spot_price, strike, T_years, sigma, mu=mu)
     no_theo_prob = 1.0 - yes_theo_prob
 
-    # Gross edge = theoretical value minus ask price
-    # Net edge = gross edge minus taker fee (fee is per contract in dollar terms)
-    gross_yes = yes_theo_prob - market.yes_ask
-    gross_no = no_theo_prob - market.no_ask
-    net_yes = gross_yes - fee
-    net_no = gross_no - fee
+    # Maker fills at bid with $0 fee; taker crosses the spread and pays the fee.
+    if maker_entry:
+        entry_yes = market.yes_bid
+        entry_no = market.no_bid
+        effective_fee = 0.0
+    else:
+        entry_yes = market.yes_ask
+        entry_no = market.no_ask
+        effective_fee = fee
+
+    gross_yes = yes_theo_prob - entry_yes
+    gross_no = no_theo_prob - entry_no
+    net_yes = gross_yes - effective_fee
+    net_no = gross_no - effective_fee
 
     log.debug(
         "%s K=%.0f S=%.0f T=%.2fh σ=%.4f → theo=%.4f  "
@@ -162,7 +172,7 @@ def evaluate(
         price=ask_price,
         gross_edge=best_gross,
         edge=best_net,
-        fee=fee,
+        fee=effective_fee,
         theo_prob=contract_theo_prob,
         strike=strike,
         mid_price=mid,
@@ -183,6 +193,7 @@ def scan_markets(
     max_bid_ask_pct_spread: float = 0.30,
     max_last_price_divergence: float = 0.15,
     mu: float = 0.0,
+    maker_entry: bool = False,
 ) -> list[Signal]:
     """
     Evaluate all markets and return signals sorted by net edge (highest first).
@@ -202,6 +213,7 @@ def scan_markets(
             max_bid_ask_pct_spread=max_bid_ask_pct_spread,
             max_last_price_divergence=max_last_price_divergence,
             mu=mu,
+            maker_entry=maker_entry,
         )
         if sig:
             signals.append(sig)

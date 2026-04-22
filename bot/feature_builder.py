@@ -91,7 +91,12 @@ def build_asset_snapshot(
     )
 
 
-def build_market_features(asset: AssetSnapshot, markets: list[Market], fee: float) -> list[MarketFeature]:
+def build_market_features(
+    asset: AssetSnapshot,
+    markets: list[Market],
+    fee: float,
+    maker_entry: bool = False,
+) -> list[MarketFeature]:
     grouped: dict[str, list[dict]] = defaultdict(list)
     raw: list[dict] = []
 
@@ -104,9 +109,21 @@ def build_market_features(asset: AssetSnapshot, markets: list[Market], fee: floa
             continue
         T_years = hours / 8760.0
         yes_theo = calc_prob(asset.spot, strike, T_years, asset.sigma_adjusted, mu=asset.mu)
-        yes_net = yes_theo - market.yes_ask - fee
         no_theo = 1.0 - yes_theo
-        no_net = no_theo - market.no_ask - fee
+
+        # Maker orders fill at the bid with $0 fee; taker orders fill at ask and pay the fee.
+        if maker_entry:
+            yes_gross = yes_theo - market.yes_bid
+            no_gross = no_theo - market.no_bid
+            effective_fee = 0.0
+        else:
+            yes_gross = yes_theo - market.yes_ask
+            no_gross = no_theo - market.no_ask
+            effective_fee = fee
+
+        yes_net = yes_gross - effective_fee
+        no_net = no_gross - effective_fee
+
         side = "yes" if yes_net >= no_net else "no"
         ask = market.yes_ask if side == "yes" else market.no_ask
         bid = market.yes_bid if side == "yes" else market.no_bid
@@ -149,9 +166,9 @@ def build_market_features(asset: AssetSnapshot, markets: list[Market], fee: floa
             "no_ask": market.no_ask,
             "spread_abs": spread_abs,
             "spread_pct": spread_pct,
-            "gross_edge": (yes_theo - market.yes_ask) if side == "yes" else (no_theo - market.no_ask),
+            "gross_edge": yes_gross if side == "yes" else no_gross,
             "edge": yes_net if side == "yes" else no_net,
-            "fee": fee,
+            "fee": effective_fee,
             "hours_to_expiry": hours,
             "distance_from_spot_sigma": sigma_distance,
             "last_price_divergence": (

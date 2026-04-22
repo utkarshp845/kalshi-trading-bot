@@ -183,6 +183,45 @@ class TestEvaluate:
             assert abs(sig.mid_price - expected_mid) < 1e-9
 
 
+class TestMakerEntry:
+    def test_maker_uses_bid_and_zero_fee(self):
+        close = _future_close(4.0)
+        market = make_market(
+            ticker="KXBTC-26APR4PM-B80000",
+            yes_ask=0.65, yes_bid=0.60,
+            no_ask=0.35, no_bid=0.30,
+            close_time=close,
+        )
+        taker_sig, _ = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE, maker_entry=False)
+        maker_sig, _ = evaluate(market, SPOT, SIGMA, MIN_EDGE, MIN_T, fee=FEE, maker_entry=True)
+
+        assert taker_sig is not None
+        assert maker_sig is not None
+        assert maker_sig.fee == pytest.approx(0.0)
+        assert taker_sig.fee == pytest.approx(FEE)
+        assert maker_sig.edge > taker_sig.edge  # bid < ask and no fee
+        assert maker_sig.gross_edge == pytest.approx(maker_sig.edge)  # gross==net when fee=0
+
+    def test_maker_signals_market_that_fails_taker_threshold(self):
+        """A market with 6-cent gross edge passes maker (6% > MIN_EDGE=5%) but fails taker (6-7=-1%)."""
+        close = _future_close(4.0)
+        # BTC at 95k, strike 80k → theo ≈ 1.0; yes_ask=0.94 → gross=0.06
+        market = make_market(
+            ticker="KXBTC-26APR4PM-B80000",
+            yes_ask=0.94, yes_bid=0.88,
+            no_ask=0.12, no_bid=0.06,
+            close_time=close,
+        )
+        min_edge = 0.05
+        taker_sig, taker_reason = evaluate(market, SPOT, SIGMA, min_edge, MIN_T, fee=FEE, maker_entry=False)
+        maker_sig, maker_reason = evaluate(market, SPOT, SIGMA, min_edge, MIN_T, fee=FEE, maker_entry=True)
+
+        assert taker_sig is None  # 0.06 - 0.07 = -0.01 < 0.05
+        assert taker_reason == "insufficient_edge"
+        assert maker_sig is not None  # theo - 0.88 ≈ 0.12 > 0.05
+        assert maker_sig.edge > min_edge
+
+
 class TestScanMarkets:
     def _good_market(self, ticker="KXBTC-26APR4PM-B80000", hours=4.0):
         return make_market(

@@ -538,7 +538,11 @@ def _build_cycle_assets(
                 open_positions=open_positions_by_symbol.get(symbol, 0),
             )
             assets[symbol] = asset
-            features = build_market_features(asset, markets_result.markets, fee=cfg.KALSHI_TAKER_FEE)
+            features = build_market_features(
+                asset, markets_result.markets,
+                fee=cfg.KALSHI_TAKER_FEE,
+                maker_entry=cfg.ENABLE_MAKER_ORDERS,
+            )
             features_by_symbol[symbol] = features
             total_markets += len(markets_result.markets)
         except Exception as e:
