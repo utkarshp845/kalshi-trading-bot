@@ -1,5 +1,6 @@
 """Tests for multi-asset feature building."""
 from dataclasses import dataclass
+from typing import Optional
 
 import pytest
 
@@ -21,7 +22,7 @@ class _PriceResult:
 @dataclass(frozen=True)
 class _IVResult:
     source: SourceSnapshot
-    iv: float | None
+    iv: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -108,3 +109,28 @@ def test_market_features_include_orderbook_depth_metrics():
     assert feature.expected_fill_price == pytest.approx(0.45)
     assert feature.depth_slippage == pytest.approx(0.0)
     assert feature.orderbook_imbalance == pytest.approx(0.5)
+
+
+def test_market_features_maker_entry_uses_bid_and_zero_fee():
+    asset = build_asset_snapshot(
+        symbol="BTC",
+        series_ticker="KXBTC",
+        price_result=_PriceResult(_source("kraken", "BTC"), 95000.0, 0.60, 0.55, 0.0),
+        markets_result=_MarketsResult(_source("kalshi", "BTC"), []),
+        iv_result=_IVResult(_source("deribit", "BTC"), 0.65),
+        store=_Store(),
+        open_positions=0,
+    )
+    market = make_market(ticker="KXBTC-26APR4PM-B95000", yes_ask=0.50, yes_bid=0.44, no_ask=0.52, no_bid=0.46)
+
+    taker_feature = build_market_features(asset, [market], fee=0.07, maker_entry=False)[0]
+    maker_feature = build_market_features(asset, [market], fee=0.07, maker_entry=True)[0]
+
+    # Maker: fee=0, entry at bid
+    assert maker_feature.fee == pytest.approx(0.0)
+    assert maker_feature.edge > taker_feature.edge  # bid < ask, so maker edge is strictly higher
+    assert maker_feature.gross_edge == pytest.approx(maker_feature.edge)  # no fee means gross==net
+
+    # Taker: fee=0.07, entry at ask
+    assert taker_feature.fee == pytest.approx(0.07)
+    assert taker_feature.gross_edge == pytest.approx(taker_feature.edge + 0.07)
