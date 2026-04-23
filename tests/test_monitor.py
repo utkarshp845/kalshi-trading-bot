@@ -41,7 +41,7 @@ class TestAlertWebhook:
 
     def test_duplicate_warning_is_deduplicated(self, monkeypatch):
         posts = []
-        now = iter([1000.0, 1005.0])
+        now = iter([1000.0, 1005.0, 1010.0, 1015.0])
         monkeypatch.setattr(monitor, "_last_sent_at", {})
         monkeypatch.setattr(monitor, "cfg", SimpleNamespace(
             ALERT_WEBHOOK_URL="https://discord.com/api/webhooks/test",

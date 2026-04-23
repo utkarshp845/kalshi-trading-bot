@@ -457,6 +457,7 @@ def _check_exits(
                     )
                 except Exception as e:
                     log.error("Exit order failed for %s: %s", pos.ticker, e)
+                    alert(f"Exit order failed for {pos.ticker}: {e}", level="ERROR")
             else:
                 if cycle_id:
                     store.log_execution_attempt(
@@ -1003,9 +1004,13 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
 
             total_filled = sum(o.fill_count for o in orders)
             total_cost = sum(o.taker_fill_cost for o in orders)
-            fill_cost = total_cost if total_cost > 0 else cost_estimate
-            risk.record_fill(fill_cost, decision.symbol)
-            balance -= fill_cost
+            if total_filled > 0:
+                # For maker fills taker_fill_cost may be 0; fall back to estimate
+                fill_cost = total_cost if total_cost > 0 else cost_estimate
+                risk.record_fill(fill_cost, decision.symbol)
+                balance -= fill_cost
+            else:
+                fill_cost = 0.0
             for o in orders:
                 store.log_order(
                     o,
