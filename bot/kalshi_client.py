@@ -242,6 +242,11 @@ class KalshiClient:
                 log.warning("Rate limited (429) on %s %s — retrying in %ds", method, path, wait)
                 time.sleep(wait)
                 continue
+            if resp.status_code in (500, 502, 503, 504) and attempt < 3:
+                wait = 2 ** attempt
+                log.warning("Server error (%d) on %s %s — retrying in %ds", resp.status_code, method, path, wait)
+                time.sleep(wait)
+                continue
             resp.raise_for_status()
             return resp.json()
         resp.raise_for_status()  # raise after exhausting retries
