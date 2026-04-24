@@ -106,16 +106,17 @@ class PortfolioRisk(DailyRisk):
             self._last_size_reason = "size_zero"
             return 0
 
-        required_visible_size = cfg.LIQUIDITY_ENTRY_MULTIPLIER * contracts
-        if signal.cumulative_size_at_entry < required_visible_size:
+        if signal.cumulative_size_at_entry > 0:
+            max_by_liquidity = int(signal.cumulative_size_at_entry / cfg.LIQUIDITY_ENTRY_MULTIPLIER)
+            if max_by_liquidity < contracts:
+                log.info(
+                    "Liquidity gate: %s capping %d→%d contracts (visible=%.0f multiplier=%.1f)",
+                    signal.ticker, contracts, max_by_liquidity,
+                    signal.cumulative_size_at_entry, cfg.LIQUIDITY_ENTRY_MULTIPLIER,
+                )
+                contracts = max_by_liquidity
+        if contracts <= 0:
             self._last_size_reason = "thin_book"
-            log.info(
-                "Liquidity gate: %s visible_size=%.2f required=%.2f contracts=%d",
-                signal.ticker,
-                signal.cumulative_size_at_entry,
-                required_visible_size,
-                contracts,
-            )
             return 0
         self._last_size_reason = ""
         return contracts
