@@ -8,13 +8,17 @@ Run:
 import argparse
 import logging
 import math
+import signal
 import statistics
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
+
+import requests
 
 import bot.config as cfg
 from bot.deribit_iv import get_atm_iv
@@ -32,6 +36,15 @@ from bot.risk import DailyRisk
 from bot.store import Store
 from bot.strategy import Signal, _hours_to_expiry, _parse_strike, scan_markets
 from bot.strategy_engine import decide_signal
+
+
+# Signals a clean shutdown — set by SIGTERM handler or KeyboardInterrupt.
+_stop_event = threading.Event()
+
+
+def _handle_sigterm(signum, frame) -> None:
+    log.info("SIGTERM received — will stop after current cycle completes")
+    _stop_event.set()
 
 
 # Map Kalshi ticker prefix → underlying symbol used by the price feed.
@@ -192,8 +205,11 @@ def run(dry_run: bool) -> None:
     global _consecutive_price_feed_failures
     _consecutive_price_feed_failures = 0
 
+    _stop_event.clear()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     try:
-        while True:
+        while not _stop_event.is_set():
             # --- Day rollover ---
             if date.today() != today_date:
                 today_date = date.today()
@@ -202,13 +218,14 @@ def run(dry_run: bool) -> None:
 
             if not cfg.FORCE_TRADING_HOURS and not _is_trading_hours():
                 log.info("Outside trading hours — sleeping %ds", cfg.POLL_INTERVAL_SECONDS)
-                time.sleep(cfg.POLL_INTERVAL_SECONDS)
+                _stop_event.wait(timeout=cfg.POLL_INTERVAL_SECONDS)
                 continue
 
             _run_cycle(kalshi, risk, store, dry_run)
-            time.sleep(cfg.POLL_INTERVAL_SECONDS)
+            _stop_event.wait(timeout=cfg.POLL_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
+        _stop_event.set()
         log.info("Shutdown requested.")
     except Exception as exc:
         alert(f"Unhandled exception in main loop: {exc}", level="CRITICAL")
@@ -591,6 +608,22 @@ def _execute_with_price_improvement(
     try:
         order1 = kalshi.place_order(ticker, side, contracts, passive_price, post_only=True)
         log.info("Maker-first entry: placed %d @ passive=%.3f (ask=%.3f)", contracts, passive_price, ask_price)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and 400 <= e.response.status_code < 500:
+            log.info(
+                "Post-only rejected for %s (HTTP %d) — falling back to taker @ %.3f",
+                ticker, e.response.status_code, ask_price,
+            )
+            try:
+                taker = kalshi.place_order(ticker, side, contracts, ask_price)
+                log.info("Taker fallback: %s x%d @ %.3f → id=%s status=%s",
+                         ticker, contracts, ask_price, taker.order_id[:8], taker.status)
+                return [taker]
+            except Exception as e2:
+                log.warning("Taker fallback also failed for %s: %s", ticker, e2)
+                return []
+        log.warning("Maker-first order failed for %s: %s", ticker, e)
+        return []
     except Exception as e:
         log.warning("Maker-first order failed for %s: %s", ticker, e)
         return []
@@ -601,7 +634,7 @@ def _execute_with_price_improvement(
     book_deteriorated = False
     elapsed = 0
 
-    while elapsed < total_wait:
+    while elapsed < total_wait and not _stop_event.is_set():
         step = min(poll, total_wait - elapsed)
         time.sleep(step)
         elapsed += step
@@ -640,8 +673,13 @@ def _execute_with_price_improvement(
             pass
 
     filled = order1.fill_count
-    kalshi.cancel_order(order1.order_id)
-    if spot_moved or book_deteriorated:
+    try:
+        kalshi.cancel_order(order1.order_id)
+    except Exception as e:
+        log.warning("Could not cancel maker order %s during cleanup: %s", order1.order_id[:8], e)
+    if _stop_event.is_set():
+        log.info("Maker-first entry for %s interrupted by shutdown — cancelled resting order", ticker)
+    elif spot_moved or book_deteriorated:
         log.info(
             "Maker-first entry canceled for %s: spot_moved=%s book_deteriorated=%s",
             ticker, spot_moved, book_deteriorated,
