@@ -1,6 +1,11 @@
 """Tests for maker-first execution in bot/main.py."""
 
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
+import requests
 
 import bot.config as cfg
 import bot.main as main_mod
@@ -28,7 +33,7 @@ class FakeKalshi:
     """Scriptable fake Kalshi client for execution tests."""
 
     def __init__(self, place_results, get_results=None):
-        # place_results: list of Order objects returned in order by place_order
+        # place_results: list of Order objects or exceptions returned by place_order
         self.place_results = list(place_results)
         # get_results: dict[order_id] -> Order (post-timeout state)
         self.get_results = get_results or {}
@@ -37,7 +42,10 @@ class FakeKalshi:
 
     def place_order(self, ticker, side, contracts, price, **kwargs):
         self.place_calls.append((ticker, side, contracts, price, kwargs))
-        return self.place_results.pop(0)
+        result = self.place_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     def get_order(self, order_id):
         return self.get_results.get(order_id) or _order(order_id, 0, 0, 0.0, 0.0)
@@ -195,3 +203,109 @@ class TestExecuteWithPriceImprovement:
 
         assert len(orders) == 1
         assert kalshi.place_calls == [("KXBTC-26APR4PM-B95000", "yes", 10, 0.40, {"post_only": True})]
+
+
+def _http_error(status_code: int) -> requests.exceptions.HTTPError:
+    resp = MagicMock()
+    resp.status_code = status_code
+    return requests.exceptions.HTTPError(response=resp)
+
+
+class TestTakerFallback:
+    def test_post_only_rejected_falls_back_to_taker(self):
+        taker_fill = _order("o2", count=5, fill_count=5, fill_cost=2.25, price=0.45)
+        kalshi = FakeKalshi(place_results=[_http_error(400), taker_fill])
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+        )
+
+        assert len(orders) == 1
+        assert orders[0].order_id == "o2"
+        assert orders[0].fill_count == 5
+        # First call: post_only maker; second call: taker at ask_price (no post_only kwarg)
+        assert kalshi.place_calls[0][4] == {"post_only": True}
+        assert "post_only" not in kalshi.place_calls[1][4]
+        assert kalshi.place_calls[1][3] == pytest.approx(0.45)
+
+    def test_post_only_rejected_taker_also_fails_returns_empty(self):
+        kalshi = FakeKalshi(place_results=[_http_error(400), _http_error(422)])
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+        )
+
+        assert orders == []
+        assert len(kalshi.place_calls) == 2
+
+    def test_5xx_error_does_not_trigger_taker_fallback(self):
+        """Network/server errors should abort — not risk a double order."""
+        kalshi = FakeKalshi(place_results=[_http_error(503)])
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+        )
+
+        assert orders == []
+        assert len(kalshi.place_calls) == 1  # only the initial post_only attempt
+
+
+class TestSigtermDuringMakerWait:
+    def test_stop_event_cancels_resting_order_and_returns_partial(self, monkeypatch):
+        monkeypatch.setattr(cfg, "MAKER_ENTRY_TIMEOUT_SEC", 60)
+        monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 1)
+
+        passive_partial = _order("o1", count=10, fill_count=3, fill_cost=1.20, price=0.40)
+        kalshi = FakeKalshi(
+            place_results=[passive_partial],
+            get_results={"o1": passive_partial},
+        )
+
+        call_count = [0]
+
+        def _sleep_then_stop(s):
+            call_count[0] += 1
+            if call_count[0] >= 1:
+                main_mod._stop_event.set()
+
+        monkeypatch.setattr(main_mod.time, "sleep", _sleep_then_stop)
+        main_mod._stop_event.clear()
+
+        try:
+            orders = main_mod._execute_with_price_improvement(
+                kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+                contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            )
+        finally:
+            main_mod._stop_event.clear()
+
+        assert len(orders) == 1
+        assert orders[0].fill_count == 3
+        assert kalshi.cancels == ["o1"]
+
+    def test_stop_event_zero_fill_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(cfg, "MAKER_ENTRY_TIMEOUT_SEC", 60)
+        monkeypatch.setattr(cfg, "STALE_ORDER_POLL_SEC", 1)
+
+        unfilled = _order("o1", count=10, fill_count=0, fill_cost=0.0, price=0.40)
+        kalshi = FakeKalshi(place_results=[unfilled], get_results={"o1": unfilled})
+
+        def _sleep_and_stop(s):
+            main_mod._stop_event.set()
+
+        monkeypatch.setattr(main_mod.time, "sleep", _sleep_and_stop)
+        main_mod._stop_event.clear()
+
+        try:
+            orders = main_mod._execute_with_price_improvement(
+                kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+                contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            )
+        finally:
+            main_mod._stop_event.clear()
+
+        assert orders == []
+        assert kalshi.cancels == ["o1"]
