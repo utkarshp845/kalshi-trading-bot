@@ -928,6 +928,18 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         ",".join(sorted(assets)),
         f" rejects={dict(reject_counts)}" if reject_counts else "",
     )
+    if len(eligible_decisions) == 0 and all_decisions:
+        # Log the closest-to-eligible rejects to aid debugging
+        near_misses = sorted(
+            [d for d in all_decisions if d.reject_reason in ("prob_band", "last_price_diverge", "edge_below_hurdle", "sigma_distance", "score_non_positive")],
+            key=lambda d: abs(d.theo_prob - 0.50),
+        )[:3]
+        for nm in near_misses:
+            log.info(
+                "Near-miss %s %s: theo=%.3f T=%.1fh edge=%.4f req=%.4f reject=%s",
+                nm.ticker, nm.side, nm.theo_prob, nm.hours_to_expiry,
+                nm.edge, nm.required_edge, nm.reject_reason,
+            )
 
     # --- Order placement ---
     for decision in eligible_decisions:
