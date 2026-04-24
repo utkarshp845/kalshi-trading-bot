@@ -62,14 +62,16 @@ def decide_signal(
 
     if trading_mode == "live":
         required_edge = max(required_edge, cfg.LIVE_MIN_REQUIRED_EDGE)
-        if (
-            len(recent_realized_edges) < cfg.LIVE_MIN_FILL_HISTORY
-            or len(recent_settled_errors) < cfg.LIVE_MIN_SETTLED_HISTORY
-        ):
-            required_edge = max(required_edge, cfg.COLD_START_MIN_EDGE)
+        fill_count = len(recent_realized_edges)
+        if fill_count < cfg.LIVE_MIN_FILL_HISTORY:
+            # Graduated: interpolate from COLD_START_MIN_EDGE → LIVE_MIN_REQUIRED_EDGE as fills accumulate
+            cold_fraction = 1.0 - (fill_count / cfg.LIVE_MIN_FILL_HISTORY)
+            cold_required = cfg.LIVE_MIN_REQUIRED_EDGE + cold_fraction * (cfg.COLD_START_MIN_EDGE - cfg.LIVE_MIN_REQUIRED_EDGE)
+            required_edge = max(required_edge, cold_required)
 
     realized_edge_proxy = feature.edge - expected_slippage - uncertainty_penalty - feature.depth_slippage
-    score = realized_edge_proxy
+    imbalance_boost = feature.orderbook_imbalance * cfg.IMBALANCE_SCORE_WEIGHT if feature.orderbook_available else 0.0
+    score = realized_edge_proxy + imbalance_boost
 
     reject_reason = ""
     if not asset.tradeable:

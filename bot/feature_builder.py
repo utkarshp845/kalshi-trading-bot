@@ -12,7 +12,7 @@ from bot.models import AssetSnapshot, MarketFeature
 from bot.pricing import calc_prob
 from bot.strategy import _hours_to_expiry, _parse_strike
 
-_MIN_SANE_STRIKES = 4
+_MIN_SANE_STRIKES = cfg.MIN_SANE_STRIKES
 _MAX_NEIGHBOR_MID_JUMP = 0.12
 
 
@@ -199,26 +199,36 @@ def build_market_features(
 
     for expiry_bucket, rows in grouped.items():
         rows.sort(key=lambda r: r["strike"])
-        if len(rows) < 2:
-            chain_break_ratio = 0.0
-        else:
-            breaks = 0
-            total = 0
-            for prev, cur in zip(rows, rows[1:]):
-                total += 1
-                if cur["yes_theo_prob"] > prev["yes_theo_prob"] + 1e-9:
-                    breaks += 1
-                prev_mid = (prev["yes_bid"] + prev["yes_ask"]) / 2.0
-                cur_mid = (cur["yes_bid"] + cur["yes_ask"]) / 2.0
-                if abs(cur_mid - prev_mid) > _MAX_NEIGHBOR_MID_JUMP:
-                    breaks += 1
-            chain_break_ratio = breaks / total if total else 0.0
+        n = len(rows)
+
+        # Compute per-adjacent-pair break flags
+        pair_breaks: list[bool] = []
+        for prev, cur in zip(rows, rows[1:]):
+            theo_break = cur["yes_theo_prob"] > prev["yes_theo_prob"] + 1e-9
+            prev_mid = (prev["yes_bid"] + prev["yes_ask"]) / 2.0
+            cur_mid = (cur["yes_bid"] + cur["yes_ask"]) / 2.0
+            mid_break = abs(cur_mid - prev_mid) > _MAX_NEIGHBOR_MID_JUMP
+            pair_breaks.append(theo_break or mid_break)
+
+        chain_break_ratio = sum(pair_breaks) / len(pair_breaks) if pair_breaks else 0.0
         sane_count = sum(1 for r in rows if r["spread_ok"] and r["last_price_ok"])
-        chain_ok = chain_break_ratio <= cfg.MAX_CHAIN_BREAK_PCT
         enough_sane = sane_count >= _MIN_SANE_STRIKES
-        for row in rows:
+
+        for i, row in enumerate(rows):
+            # Per-contract chain_ok: only False when BOTH neighbors are broken.
+            # Edge contracts (index 0 or n-1) need only their one neighbor to be intact.
+            left_break = pair_breaks[i - 1] if i > 0 else False
+            right_break = pair_breaks[i] if i < n - 1 else False
+            if n == 1:
+                row_chain_ok = True
+            elif i == 0:
+                row_chain_ok = not right_break
+            elif i == n - 1:
+                row_chain_ok = not left_break
+            else:
+                row_chain_ok = not (left_break and right_break)
             row["chain_break_ratio"] = chain_break_ratio
-            row["chain_ok"] = chain_ok
+            row["chain_ok"] = row_chain_ok
             row["enough_sane_strikes"] = enough_sane
 
     return [MarketFeature(**row) for row in raw]
