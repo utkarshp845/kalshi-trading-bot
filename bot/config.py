@@ -55,7 +55,7 @@ MAX_VOL_RATIO: float = _float("MAX_VOL_RATIO", 2.5)  # was 1.8 — volatile regi
 MIN_BID_ASK_SPREAD: float = _float("MIN_BID_ASK_SPREAD", 0.0)   # minimum acceptable bid (liquidity filter)
 MAX_BID_ASK_SPREAD: float = _float("MAX_BID_ASK_SPREAD", 0.12)  # skip markets where ask-bid > this (wide spread = phantom edge)
 MAX_BID_ASK_PCT_SPREAD: float = _float("MAX_BID_ASK_PCT_SPREAD", 0.20)  # skip if spread > 20% of mid-price (relative illiquidity filter)
-MAX_LAST_PRICE_DIVERGENCE: float = _float("MAX_LAST_PRICE_DIVERGENCE", 0.15)  # skip if last_price diverges > 0.15 from yes_mid (stale/moving market)
+MAX_LAST_PRICE_DIVERGENCE: float = _float("MAX_LAST_PRICE_DIVERGENCE", 0.20)  # skip if last_price diverges > 0.20 from yes_mid (stale/moving market)
 THEO_PROB_BAND_MIN: float = _float("THEO_PROB_BAND_MIN", 0.25)
 THEO_PROB_BAND_MAX: float = _float("THEO_PROB_BAND_MAX", 0.75)
 MAX_SIGMA_DISTANCE: float = _float("MAX_SIGMA_DISTANCE", 1.5)
