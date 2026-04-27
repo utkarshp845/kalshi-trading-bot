@@ -11,7 +11,7 @@ def make_market(
     yes_bid=0.40,
     no_ask=0.55,
     no_bid=0.50,
-    close_time="2026-04-26T20:00:00Z",
+    close_time="2099-04-26T20:00:00Z",
     last_price=None,
     status="open",
 ) -> Market:

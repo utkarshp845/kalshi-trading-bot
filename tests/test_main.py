@@ -98,7 +98,7 @@ def test_check_exits_triggers_take_profit_path(monkeypatch):
         (),
         {
             "ticker": "KXBTC-26APR4PM-B95000",
-            "close_time": "2026-04-26T20:00:00Z",
+            "close_time": "2099-04-26T20:00:00Z",
             "yes_bid": 0.40,
             "yes_ask": 0.45,
             "no_bid": 0.55,

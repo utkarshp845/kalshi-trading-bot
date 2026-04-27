@@ -219,6 +219,7 @@ class TestTakerFallback:
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
             contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,
         )
 
         assert len(orders) == 1
@@ -229,12 +230,25 @@ class TestTakerFallback:
         assert "post_only" not in kalshi.place_calls[1][4]
         assert kalshi.place_calls[1][3] == pytest.approx(0.45)
 
+    def test_post_only_rejected_skips_taker_when_edge_no_longer_clears_hurdle(self):
+        kalshi = FakeKalshi(place_results=[_http_error(400)])
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.20, required_edge=0.25,
+        )
+
+        assert orders == []
+        assert len(kalshi.place_calls) == 1
+
     def test_post_only_rejected_taker_also_fails_returns_empty(self):
         kalshi = FakeKalshi(place_results=[_http_error(400), _http_error(422)])
 
         orders = main_mod._execute_with_price_improvement(
             kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
             contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,
         )
 
         assert orders == []

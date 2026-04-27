@@ -439,7 +439,7 @@ def _check_exits(
                     else:
                         orders = [kalshi.sell_position(pos.ticker, pos.side, pos.quantity, sell_price)]
                     total_filled = sum(order.fill_count for order in orders)
-                    total_cost = sum(order.taker_fill_cost for order in orders)
+                    total_cost = sum(order.fill_cost for order in orders)
                     for order in orders:
                         store.log_order(
                             order,
@@ -578,6 +578,8 @@ def _execute_with_price_improvement(
     bid_price: float = 0.0,
     dry_run: bool = False,
     symbol: str = "BTC",
+    taker_edge: Optional[float] = None,
+    required_edge: Optional[float] = None,
 ) -> list[Order]:
     """
     Maker-first entry: post at the live market bid with post_only=True and
@@ -610,9 +612,21 @@ def _execute_with_price_improvement(
         log.info("Maker-first entry: placed %d @ passive=%.3f (ask=%.3f)", contracts, passive_price, ask_price)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and 400 <= e.response.status_code < 500:
+            if taker_edge is None or required_edge is None:
+                log.info(
+                    "Post-only rejected for %s (HTTP %d) — no taker edge check supplied; skipping fallback",
+                    ticker, e.response.status_code,
+                )
+                return []
+            if taker_edge < required_edge:
+                log.info(
+                    "Post-only rejected for %s (HTTP %d) — taker edge %.4f below required %.4f; skipping fallback",
+                    ticker, e.response.status_code, taker_edge, required_edge,
+                )
+                return []
             log.info(
-                "Post-only rejected for %s (HTTP %d) — falling back to taker @ %.3f",
-                ticker, e.response.status_code, ask_price,
+                "Post-only rejected for %s (HTTP %d) — taker edge %.4f clears %.4f; falling back @ %.3f",
+                ticker, e.response.status_code, taker_edge, required_edge, ask_price,
             )
             try:
                 taker = kalshi.place_order(ticker, side, contracts, ask_price)
@@ -880,8 +894,8 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         return
 
     # --- Fill quality check ---
-    _check_fills(kalshi, store)
     _backfill_market_outcomes(kalshi, store, before_iso=cycle_id)
+    _check_fills(kalshi, store)
 
     # --- Position exit check (loss + take-profit, routed by underlying) ---
     exited_tickers = _check_exits(kalshi, store, positions, assets, trading_mode, cycle_id=cycle_id)
@@ -1032,6 +1046,8 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 bid_price=getattr(decision, "bid_price", 0.0),
                 dry_run=False,
                 symbol=decision.symbol,
+                taker_edge=decision.theo_prob - decision.ask - cfg.KALSHI_TAKER_FEE,
+                required_edge=decision.required_edge,
             )
             if not orders:
                 store.log_execution_attempt(
@@ -1053,10 +1069,9 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 continue
 
             total_filled = sum(o.fill_count for o in orders)
-            total_cost = sum(o.taker_fill_cost for o in orders)
+            total_cost = sum(o.fill_cost for o in orders)
             if total_filled > 0:
-                # For maker fills taker_fill_cost may be 0; fall back to estimate
-                fill_cost = total_cost if total_cost > 0 else cost_estimate
+                fill_cost = total_cost
                 risk.record_fill(fill_cost, decision.symbol)
                 balance -= fill_cost
             else:

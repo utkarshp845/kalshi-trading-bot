@@ -167,6 +167,31 @@ class Order:
     fill_count: int
     taker_fill_cost: float
     created_time: str
+    maker_fill_cost: float = 0.0
+    taker_fees: float = 0.0
+    maker_fees: float = 0.0
+
+    @property
+    def contract_price(self) -> float:
+        return self.yes_price if self.side == "yes" else self.no_price
+
+    @property
+    def fill_cost(self) -> float:
+        """
+        Total cost/proceeds reported for filled contracts.
+
+        Kalshi reports maker and taker fill costs separately. If an older
+        response omits them despite a fill, fall back to the submitted limit
+        price so risk and fill-quality accounting do not record a free fill.
+        """
+        explicit_cost = self.taker_fill_cost + self.maker_fill_cost
+        if explicit_cost > 0 or self.fill_count <= 0:
+            return explicit_cost
+        return self.contract_price * self.fill_count
+
+    @property
+    def fees(self) -> float:
+        return self.taker_fees + self.maker_fees
 
     @classmethod
     def from_dict(cls, d: dict) -> "Order":
@@ -183,6 +208,9 @@ class Order:
             fill_count=int(float(d.get("fill_count_fp") or 0)),
             taker_fill_cost=_money_from_dict(d, "taker_fill_cost_dollars", "taker_fill_cost"),
             created_time=d.get("created_time", ""),
+            maker_fill_cost=_money_from_dict(d, "maker_fill_cost_dollars", "maker_fill_cost"),
+            taker_fees=_money_from_dict(d, "taker_fees_dollars", "taker_fees"),
+            maker_fees=_money_from_dict(d, "maker_fees_dollars", "maker_fees"),
         )
 
 

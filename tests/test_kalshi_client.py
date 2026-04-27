@@ -36,12 +36,34 @@ class TestMoneyParsing:
             "initial_count_fp": "2",
             "fill_count_fp": "2",
             "taker_fill_cost": 90,
+            "maker_fill_cost": 10,
+            "taker_fees": 4,
+            "maker_fees": 1,
             "created_time": "2026-04-16T12:00:00Z",
         })
 
         assert order.yes_price == 0.45
         assert order.no_price == 0.55
         assert order.taker_fill_cost == 0.90
+        assert order.maker_fill_cost == 0.10
+        assert order.fill_cost == 1.00
+        assert order.fees == 0.05
+
+    def test_order_fill_cost_falls_back_to_limit_price_when_cost_fields_missing(self):
+        order = Order.from_dict({
+            "order_id": "o-1",
+            "ticker": "KXBTC-26APR4PM-B95000",
+            "side": "yes",
+            "action": "buy",
+            "status": "filled",
+            "yes_price": 45,
+            "no_price": 55,
+            "initial_count_fp": "2",
+            "fill_count_fp": "2",
+            "created_time": "2026-04-16T12:00:00Z",
+        })
+
+        assert order.fill_cost == 0.90
 
     def test_balance_parses_cent_field_as_dollars(self):
         client = object.__new__(KalshiClient)

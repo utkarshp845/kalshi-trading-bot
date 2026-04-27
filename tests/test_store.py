@@ -56,9 +56,20 @@ class TestGetUnfilledOrders:
         unfilled = store.get_unfilled_orders()
         assert order.order_id in unfilled
 
-    def test_does_not_return_filled_orders(self, store):
+    def test_returns_filled_orders_until_settlement_recorded(self, store):
         order = _make_order(status="filled")
         store.log_order(order, theo_prob=0.67, gross_edge=0.22, edge=0.15, fee=0.07)
+        unfilled = store.get_unfilled_orders()
+        assert order.order_id in unfilled
+
+    def test_does_not_return_settled_orders_with_outcome(self, store):
+        order = _make_order(status="settled", fill_count=1, taker_fill_cost=0.45)
+        store.log_order(order, theo_prob=0.67, gross_edge=0.22, edge=0.15, fee=0.07)
+        store._conn.execute(
+            "UPDATE orders SET settled_value = 1.0 WHERE order_id = ?",
+            (order.order_id,),
+        )
+        store._conn.commit()
         unfilled = store.get_unfilled_orders()
         assert order.order_id not in unfilled
 
@@ -108,6 +119,90 @@ class TestUpdateOrderFill:
         ).fetchone()
         assert row["fill_price_dollars"] == pytest.approx(0.50)
         assert row["realized_edge"] == pytest.approx(0.82 - 0.50 - 0.07)
+
+    def test_fill_cost_includes_maker_fill_cost(self, store):
+        order = _make_order(
+            order_id="maker-1",
+            status="resting",
+            yes_price=0.44,
+        )
+        store.log_order(order, theo_prob=0.67, gross_edge=0.23, edge=0.23, fee=0.0)
+
+        filled = _make_order(
+            order_id="maker-1",
+            status="filled",
+            yes_price=0.44,
+            fill_count=3,
+            taker_fill_cost=0.0,
+            maker_fill_cost=1.32,
+        )
+        store.update_order_fill(filled)
+
+        row = store._conn.execute(
+            "SELECT cost_dollars, fill_price_dollars, realized_edge FROM orders WHERE order_id = ?",
+            ("maker-1",),
+        ).fetchone()
+        assert row["cost_dollars"] == pytest.approx(1.32)
+        assert row["fill_price_dollars"] == pytest.approx(0.44)
+        assert row["realized_edge"] == pytest.approx(0.67 - 0.44)
+
+    def test_fill_cost_falls_back_to_limit_price_when_cost_fields_missing(self, store):
+        order = _make_order(order_id="maker-fallback", status="resting", yes_price=0.44)
+        store.log_order(order, theo_prob=0.67, gross_edge=0.23, edge=0.23, fee=0.0)
+
+        filled = _make_order(
+            order_id="maker-fallback",
+            status="filled",
+            yes_price=0.44,
+            fill_count=3,
+            taker_fill_cost=0.0,
+            maker_fill_cost=0.0,
+        )
+        store.update_order_fill(filled)
+
+        row = store._conn.execute(
+            "SELECT cost_dollars, fill_price_dollars FROM orders WHERE order_id = ?",
+            ("maker-fallback",),
+        ).fetchone()
+        assert row["cost_dollars"] == pytest.approx(1.32)
+        assert row["fill_price_dollars"] == pytest.approx(0.44)
+
+    def test_settlement_uses_market_outcome_not_order_fill_count(self, store):
+        yes_order = _make_order(
+            order_id="settle-yes",
+            side="yes",
+            status="filled",
+            fill_count=1,
+            taker_fill_cost=0.45,
+        )
+        no_order = _make_order(
+            order_id="settle-no",
+            side="no",
+            yes_price=0.0,
+            no_price=0.55,
+            status="filled",
+            fill_count=1,
+            taker_fill_cost=0.55,
+        )
+        store.log_order(yes_order, theo_prob=0.60, gross_edge=0.15, edge=0.08, fee=0.07)
+        store.log_order(no_order, theo_prob=0.40, gross_edge=-0.15, edge=-0.22, fee=0.07)
+        store.upsert_market_outcome(
+            ticker=yes_order.ticker,
+            result="no",
+            settlement_value=0.0,
+            close_time="2099-04-26T20:00:00Z",
+            settlement_ts="2099-04-26T20:01:00Z",
+        )
+
+        store.update_order_fill(_make_order(order_id="settle-yes", side="yes", status="settled", fill_count=1, taker_fill_cost=0.45))
+        store.update_order_fill(_make_order(order_id="settle-no", side="no", yes_price=0.0, no_price=0.55, status="settled", fill_count=1, taker_fill_cost=0.55))
+
+        rows = {
+            row["order_id"]: row["settled_value"]
+            for row in store._conn.execute("SELECT order_id, settled_value FROM orders").fetchall()
+        }
+        assert rows["settle-yes"] == pytest.approx(0.0)
+        assert rows["settle-no"] == pytest.approx(1.0)
 
 
 class TestMigrations:

@@ -61,6 +61,10 @@ class Store:
                 count               INTEGER,
                 fill_count          INTEGER,
                 cost_dollars        REAL,
+                taker_fill_cost     REAL,
+                maker_fill_cost     REAL,
+                taker_fees          REAL,
+                maker_fees          REAL,
                 theo_prob           REAL,
                 gross_edge          REAL,
                 edge                REAL,
@@ -244,6 +248,10 @@ class Store:
             "slippage":           "REAL",
             "realized_edge":      "REAL",
             "fill_checked_at":    "TEXT",
+            "taker_fill_cost":     "REAL",
+            "maker_fill_cost":     "REAL",
+            "taker_fees":          "REAL",
+            "maker_fees":          "REAL",
         }
         existing = {
             row[1]
@@ -367,8 +375,9 @@ class Store:
             INSERT OR REPLACE INTO orders
               (order_id, client_order_id, ticker, side, action, status,
                yes_price, no_price, count, fill_count, cost_dollars,
+               taker_fill_cost, maker_fill_cost, taker_fees, maker_fees,
                theo_prob, gross_edge, edge, fee, hours_to_expiry, created_time, logged_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             order.order_id,
             order.client_order_id,
@@ -380,7 +389,11 @@ class Store:
             order.no_price,
             order.count,
             order.fill_count,
+            order.fill_cost,
             order.taker_fill_cost,
+            order.maker_fill_cost,
+            order.taker_fees,
+            order.maker_fees,
             theo_prob,
             gross_edge,
             edge,
@@ -399,8 +412,9 @@ class Store:
         realized_edge: Optional[float] = None
         settled_value: Optional[float] = None
 
-        if order.fill_count > 0 and order.taker_fill_cost > 0:
-            fill_price = order.taker_fill_cost / order.fill_count
+        total_fill_cost = order.fill_cost
+        if order.fill_count > 0 and total_fill_cost > 0:
+            fill_price = total_fill_cost / order.fill_count
             # Fetch theo_prob and fee stored at order entry time
             row = self._conn.execute(
                 "SELECT theo_prob, fee, yes_price, no_price FROM orders WHERE order_id = ?",
@@ -413,26 +427,37 @@ class Store:
                 if theo_prob is not None and fee is not None:
                     realized_edge = theo_prob - fill_price - (fee or 0.0)
 
-        # Detect settlement and record outcome for probability calibration.
-        # At settlement: status is 'settled' or 'expired'.
-        # A winning YES contract: fill_count > 0 after settlement (Kalshi settles by filling).
-        # A losing YES contract: fill_count == 0 at settlement (no payout).
+        # Detect settlement from the market outcome, not order fill_count. A
+        # filled order can still be a losing contract; fill_count measures entry
+        # execution, not final payout.
         if order.status in ("settled", "expired"):
             if order.action == "buy":
-                if order.side == "yes":
-                    settled_value = 1.0 if order.fill_count > 0 else 0.0
-                else:  # side == "no"
-                    settled_value = 1.0 if order.fill_count > 0 else 0.0
-                log.info(
-                    "Settlement %s: side=%s fill_count=%d → settled_value=%.1f",
-                    order.order_id[:8], order.side, order.fill_count, settled_value,
-                )
+                outcome = self._conn.execute(
+                    "SELECT settlement_value FROM market_outcomes WHERE ticker = ?",
+                    (order.ticker,),
+                ).fetchone()
+                if outcome is not None and outcome["settlement_value"] is not None:
+                    yes_value = float(outcome["settlement_value"])
+                    settled_value = yes_value if order.side == "yes" else 1.0 - yes_value
+                    log.info(
+                        "Settlement %s: side=%s market_yes=%.1f → contract_value=%.1f",
+                        order.order_id[:8], order.side, yes_value, settled_value,
+                    )
+                else:
+                    log.info(
+                        "Settlement %s: market outcome unavailable for %s; leaving unsettled",
+                        order.order_id[:8], order.ticker,
+                    )
 
         self._conn.execute("""
             UPDATE orders
                SET status             = ?,
                    fill_count         = ?,
                    cost_dollars       = ?,
+                   taker_fill_cost    = ?,
+                   maker_fill_cost    = ?,
+                   taker_fees         = ?,
+                   maker_fees         = ?,
                    fill_price_dollars = ?,
                    slippage           = ?,
                    realized_edge      = ?,
@@ -442,7 +467,11 @@ class Store:
         """, (
             order.status,
             order.fill_count,
+            total_fill_cost,
             order.taker_fill_cost,
+            order.maker_fill_cost,
+            order.taker_fees,
+            order.maker_fees,
             fill_price,
             slippage,
             realized_edge,
@@ -615,12 +644,16 @@ class Store:
     # ------------------------------------------------------------------
 
     def get_unfilled_orders(self, max_age_hours: int = 48) -> list[str]:
-        """Return order_ids placed within the last max_age_hours that are not yet fully filled."""
+        """Return order_ids that still need fill/settlement refresh."""
         cutoff = datetime.now(timezone.utc).isoformat()[:10]  # today's date prefix
         rows = self._conn.execute("""
             SELECT order_id FROM orders
-             WHERE status NOT IN ('filled', 'canceled', 'expired')
-               AND logged_at >= ?
+             WHERE logged_at >= ?
+               AND status != 'canceled'
+               AND (
+                   status NOT IN ('expired', 'settled')
+                   OR (action = 'buy' AND fill_count > 0 AND settled_value IS NULL)
+               )
         """, (cutoff,)).fetchall()
         return [r[0] for r in rows]
 
@@ -896,6 +929,6 @@ class Store:
                 ])
             writer.writerow([
                 logged_at, order.order_id, order.ticker, order.side, order.action, order.status,
-                order.count, order.fill_count, order.taker_fill_cost,
+                order.count, order.fill_count, order.fill_cost,
                 theo_prob, gross_edge, edge, fee, hours_to_expiry,
             ])

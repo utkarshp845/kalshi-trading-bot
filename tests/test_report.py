@@ -61,6 +61,13 @@ class TestGenerateReport:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         order = _order(order_id="win-1", taker_fill_cost=4.50, fill_count=10)
         store.log_order(order, theo_prob=0.67, gross_edge=0.22, edge=0.15, fee=0.07)
+        store.upsert_market_outcome(
+            ticker=order.ticker,
+            result="yes",
+            settlement_value=1.0,
+            close_time="2099-04-26T20:00:00Z",
+            settlement_ts="2099-04-26T20:01:00Z",
+        )
         settled = replace(order, status="settled", fill_count=10, taker_fill_cost=4.50)
         store.update_order_fill(settled)
 
@@ -74,7 +81,14 @@ class TestGenerateReport:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         order = _order(order_id="loss-1", taker_fill_cost=4.50, fill_count=10)
         store.log_order(order, theo_prob=0.67, gross_edge=0.22, edge=0.15, fee=0.07)
-        settled_loser = replace(order, status="settled", fill_count=0, taker_fill_cost=4.50)
+        store.upsert_market_outcome(
+            ticker=order.ticker,
+            result="no",
+            settlement_value=0.0,
+            close_time="2099-04-26T20:00:00Z",
+            settlement_ts="2099-04-26T20:01:00Z",
+        )
+        settled_loser = replace(order, status="settled", fill_count=10, taker_fill_cost=4.50)
         store.update_order_fill(settled_loser)
 
         out = generate_report(today, store._db_path, tmp_path / "reports")
