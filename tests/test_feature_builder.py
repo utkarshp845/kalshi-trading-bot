@@ -111,7 +111,7 @@ def test_market_features_include_orderbook_depth_metrics():
     assert feature.orderbook_imbalance == pytest.approx(0.5)
 
 
-def test_market_features_maker_entry_uses_bid_and_zero_fee():
+def test_market_features_maker_entry_uses_bid_and_maker_fee():
     asset = build_asset_snapshot(
         symbol="BTC",
         series_ticker="KXBTC",
@@ -126,11 +126,11 @@ def test_market_features_maker_entry_uses_bid_and_zero_fee():
     taker_feature = build_market_features(asset, [market], fee=0.07, maker_entry=False)[0]
     maker_feature = build_market_features(asset, [market], fee=0.07, maker_entry=True)[0]
 
-    # Maker: fee=0, entry at bid
-    assert maker_feature.fee == pytest.approx(0.0)
+    # Maker: entry at bid with the lower maker fee formula
+    assert maker_feature.fee == pytest.approx(0.01)
     assert maker_feature.edge > taker_feature.edge  # bid < ask, so maker edge is strictly higher
-    assert maker_feature.gross_edge == pytest.approx(maker_feature.edge)  # no fee means gross==net
+    assert maker_feature.gross_edge == pytest.approx(maker_feature.edge + maker_feature.fee)
 
-    # Taker: fee=0.07, entry at ask
-    assert taker_feature.fee == pytest.approx(0.07)
-    assert taker_feature.gross_edge == pytest.approx(taker_feature.edge + 0.07)
+    # Taker: fee is price-dependent, not a flat 7 cents
+    assert taker_feature.fee == pytest.approx(0.02)
+    assert taker_feature.gross_edge == pytest.approx(taker_feature.edge + taker_feature.fee)

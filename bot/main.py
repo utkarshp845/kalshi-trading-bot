@@ -22,6 +22,7 @@ import requests
 
 import bot.config as cfg
 from bot.deribit_iv import get_atm_iv
+from bot.fees import fee_per_contract
 from bot.feature_builder import build_asset_snapshot, build_market_features
 from bot.implied_vol import fit_cycle_iv
 from bot.kalshi_client import KalshiClient, Market, Order, Position
@@ -395,7 +396,8 @@ def _check_exits(
         current_value = theo_prob if pos.side == "yes" else (1.0 - theo_prob)
         current_bid = market.yes_bid if pos.side == "yes" else market.no_bid
         current_ask = market.yes_ask if pos.side == "yes" else market.no_ask
-        liquidation_edge = current_value - current_bid - cfg.KALSHI_TAKER_FEE
+        liquidation_fee = fee_per_contract(current_bid, pos.quantity, cfg.KALSHI_TAKER_FEE)
+        liquidation_edge = current_value - current_bid - liquidation_fee
         near_expiry = T_hours < (20.0 / 60.0)
         take_profit_hit = (
             current_value >= (cfg.TAKE_PROFIT_TRIGGER * entry_price_per_contract)
@@ -445,8 +447,8 @@ def _check_exits(
                             order,
                             theo_prob=theo_prob,
                             gross_edge=current_value - sell_price,
-                            edge=current_value - sell_price - cfg.KALSHI_TAKER_FEE,
-                            fee=cfg.KALSHI_TAKER_FEE,
+                            edge=current_value - sell_price - fee_per_contract(sell_price, max(1, order.fill_count or pos.quantity), cfg.KALSHI_TAKER_FEE),
+                            fee=fee_per_contract(sell_price, max(1, order.fill_count or pos.quantity), cfg.KALSHI_TAKER_FEE),
                             hours_to_expiry=T_hours,
                         )
                     if cycle_id:
@@ -1046,7 +1048,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 bid_price=getattr(decision, "bid_price", 0.0),
                 dry_run=False,
                 symbol=decision.symbol,
-                taker_edge=decision.theo_prob - decision.ask - cfg.KALSHI_TAKER_FEE,
+                taker_edge=decision.theo_prob - decision.ask - fee_per_contract(decision.ask, contracts, cfg.KALSHI_TAKER_FEE),
                 required_edge=decision.required_edge,
             )
             if not orders:
@@ -1069,7 +1071,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 continue
 
             total_filled = sum(o.fill_count for o in orders)
-            total_cost = sum(o.fill_cost for o in orders)
+            total_cost = sum(o.total_cost for o in orders)
             if total_filled > 0:
                 fill_cost = total_cost
                 risk.record_fill(fill_cost, decision.symbol)

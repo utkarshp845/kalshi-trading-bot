@@ -48,6 +48,7 @@ class TestMoneyParsing:
         assert order.maker_fill_cost == 0.10
         assert order.fill_cost == 1.00
         assert order.fees == 0.05
+        assert order.total_cost == 1.05
 
     def test_order_fill_cost_falls_back_to_limit_price_when_cost_fields_missing(self):
         order = Order.from_dict({

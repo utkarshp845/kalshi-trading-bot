@@ -111,6 +111,8 @@ Copy `.env.example` to `.env` and set your credentials plus the mode you want.
 | `ENABLE_BTC` | `true` | Enable BTC markets |
 | `ENABLE_ETH` | `true` | Enable ETH markets |
 | `MIN_EDGE` | `0.15` | Hard minimum net edge floor |
+| `KALSHI_TAKER_FEE` | `0.07` | Taker fee coefficient used in `rate * contracts * price * (1-price)` |
+| `KALSHI_MAKER_FEE` | `0.0175` | Maker fee coefficient where maker fees apply |
 
 ### Safer-PnL Strategy Gates
 
@@ -126,6 +128,10 @@ Copy `.env.example` to `.env` and set your credentials plus the mode you want.
 | `MAX_DEPTH_SLIPPAGE_PER_CONTRACT` | `0.02` | Reject when orderbook-implied slippage per contract exceeds this |
 | `LIQUIDITY_ENTRY_MULTIPLIER` | `5.0` | Visible resting size required vs intended contract count |
 | `ORDERBOOK_DEPTH` | `20` | Orderbook levels requested per market snapshot |
+| `BUCKET_EDGE_MIN_TRADES` | `8` | Minimum similar fills before blocking a losing trade bucket |
+| `BUCKET_EDGE_LOOKBACK_DAYS` | `21` | Lookback for bucket-level realized edge |
+| `MAKER_FILL_MIN_ATTEMPTS` | `8` | Minimum live attempts before trusting maker fill rate |
+| `DEFAULT_MAKER_FILL_PROB` | `0.50` | Conservative maker fill probability before enough history |
 
 ### Data Freshness
 

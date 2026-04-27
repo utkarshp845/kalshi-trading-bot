@@ -203,6 +203,9 @@ class Store:
                 depth_slippage           REAL,
                 orderbook_imbalance      REAL,
                 orderbook_available      INTEGER,
+                bucket_avg_realized_edge REAL,
+                bucket_sample_size       INTEGER,
+                maker_fill_prob          REAL,
                 logged_at                TEXT NOT NULL,
                 PRIMARY KEY (cycle_id, ticker, side)
             );
@@ -292,6 +295,9 @@ class Store:
             "depth_slippage": "REAL",
             "orderbook_imbalance": "REAL",
             "orderbook_available": "INTEGER",
+            "bucket_avg_realized_edge": "REAL",
+            "bucket_sample_size": "INTEGER",
+            "maker_fill_prob": "REAL",
         }
         existing_market_snapshots = {
             row[1]
@@ -389,7 +395,7 @@ class Store:
             order.no_price,
             order.count,
             order.fill_count,
-            order.fill_cost,
+            order.total_cost,
             order.taker_fill_cost,
             order.maker_fill_cost,
             order.taker_fees,
@@ -424,8 +430,9 @@ class Store:
                 theo_prob, fee, yes_price, no_price = row
                 entry_ask = yes_price if order.side == "yes" else no_price
                 slippage = fill_price - (entry_ask or fill_price)
-                if theo_prob is not None and fee is not None:
-                    realized_edge = theo_prob - fill_price - (fee or 0.0)
+                actual_fee = order.fees / order.fill_count if order.fees > 0 else (fee or 0.0)
+                if theo_prob is not None:
+                    realized_edge = theo_prob - fill_price - actual_fee
 
         # Detect settlement from the market outcome, not order fill_count. A
         # filled order can still be a losing contract; fill_count measures entry
@@ -467,7 +474,7 @@ class Store:
         """, (
             order.status,
             order.fill_count,
-            total_fill_cost,
+            order.total_cost,
             order.taker_fill_cost,
             order.maker_fill_cost,
             order.taker_fees,
@@ -579,8 +586,9 @@ class Store:
                ask, bid, mid_price, gross_edge, edge, fee, hours_to_expiry,
                strike, distance_from_spot_sigma, degraded, chain_break_ratio,
                top_of_book_size, resting_size_at_entry, cumulative_size_at_entry,
-               expected_fill_price, depth_slippage, orderbook_imbalance, orderbook_available, logged_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               expected_fill_price, depth_slippage, orderbook_imbalance, orderbook_available,
+               bucket_avg_realized_edge, bucket_sample_size, maker_fill_prob, logged_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             cycle_id, decision.symbol, decision.ticker, decision.side, int(decision.eligible),
             decision.score, decision.required_edge, decision.expected_slippage,
@@ -590,7 +598,9 @@ class Store:
             decision.distance_from_spot_sigma, int(decision.degraded),
             decision.chain_break_ratio, decision.top_of_book_size, decision.resting_size_at_entry,
             decision.cumulative_size_at_entry, decision.expected_fill_price, decision.depth_slippage,
-            decision.orderbook_imbalance, int(decision.orderbook_available), _now_iso(),
+            decision.orderbook_imbalance, int(decision.orderbook_available),
+            decision.bucket_avg_realized_edge, decision.bucket_sample_size,
+            decision.maker_fill_prob, _now_iso(),
         ))
         self._conn.commit()
 
@@ -820,6 +830,114 @@ class Store:
         ratio = float(avg_realized) / float(avg_predicted)
         return max(0.3, min(1.0, ratio))
 
+    @staticmethod
+    def _bucket_predicate(column: str, bucket: str) -> tuple[str, list[object]]:
+        ranges = {
+            "p25_35": (0.25, 0.35, False),
+            "p35_50": (0.35, 0.50, False),
+            "p50_65": (0.50, 0.65, True),
+            "p65_75": (0.65, 0.75, True),
+            "t1_2h": (1.0, 2.0, False),
+            "t2_6h": (2.0, 6.0, False),
+            "t6h_plus": (6.0, None, True),
+            "spread_tight": (0.0, 0.08, False),
+            "spread_mid": (0.08, 0.15, False),
+            "spread_wide": (0.15, None, True),
+            "sigma_near": (0.0, 0.5, False),
+            "sigma_mid": (0.5, 1.0, False),
+            "sigma_far": (1.0, None, True),
+        }
+        low, high, inclusive_high = ranges[bucket]
+        if high is None:
+            return f"{column} >= ?", [low]
+        op = "<=" if inclusive_high else "<"
+        return f"{column} >= ? AND {column} {op} ?", [low, high]
+
+    def get_bucket_realized_stats(
+        self,
+        symbol: str,
+        side: str,
+        prob_bucket: str,
+        time_bucket: str,
+        spread_bucket: str,
+        sigma_bucket: str,
+        lookback_days: int = 21,
+        before_iso: Optional[str] = None,
+    ) -> tuple[Optional[float], int]:
+        """Return avg realized entry edge and sample count for a similar-trade bucket."""
+        from datetime import timedelta as _td
+
+        lookback_date = (
+            datetime.now(timezone.utc) - _td(days=lookback_days)
+        ).isoformat()[:10]
+        predicates = [
+            "sd.symbol = ?",
+            "sd.side = ?",
+            "sd.logged_at >= ?",
+            "ea.filled_contracts > 0",
+            "ea.actual_cost > 0",
+            "ea.status IN ('live_fill', 'paper_fill')",
+        ]
+        params: list[object] = [symbol, side, lookback_date]
+        if before_iso:
+            predicates.append("sd.logged_at <= ?")
+            params.append(before_iso)
+
+        for column, bucket in (
+            ("sd.theo_prob", prob_bucket),
+            ("sd.hours_to_expiry", time_bucket),
+            ("ms.spread_pct", spread_bucket),
+            ("sd.distance_from_spot_sigma", sigma_bucket),
+        ):
+            predicate, bucket_params = self._bucket_predicate(column, bucket)
+            predicates.append(predicate)
+            params.extend(bucket_params)
+
+        where = " AND ".join(f"({p})" for p in predicates)
+        row = self._conn.execute(f"""
+            SELECT AVG(sd.theo_prob - (ea.actual_cost / ea.filled_contracts) - COALESCE(sd.fee, 0.0)),
+                   COUNT(*)
+              FROM signal_decisions sd
+              JOIN execution_attempts ea
+                ON ea.cycle_id = sd.cycle_id
+               AND ea.ticker = sd.ticker
+               AND ea.side = sd.side
+              LEFT JOIN market_snapshots ms
+                ON ms.cycle_id = sd.cycle_id
+               AND ms.ticker = sd.ticker
+             WHERE {where}
+        """, params).fetchone()
+        if row is None:
+            return None, 0
+        count = int(row[1] or 0)
+        return (float(row[0]) if row[0] is not None else None), count
+
+    def get_maker_fill_stats(
+        self,
+        symbol: str,
+        n: int = 40,
+        before_iso: Optional[str] = None,
+    ) -> tuple[int, int, int]:
+        """Return (filled contracts, requested contracts, attempts) for recent live maker attempts."""
+        sql = """
+            SELECT filled_contracts, requested_contracts
+              FROM execution_attempts
+             WHERE symbol = ?
+               AND trading_mode = 'live'
+               AND requested_contracts > 0
+               AND status IN ('live_fill', 'live_no_fill', 'no_fill')
+        """
+        params: list[object] = [symbol]
+        if before_iso:
+            sql += " AND logged_at <= ?"
+            params.append(before_iso)
+        sql += " ORDER BY logged_at DESC LIMIT ?"
+        params.append(n)
+        rows = self._conn.execute(sql, params).fetchall()
+        filled = sum(int(r["filled_contracts"] or 0) for r in rows)
+        requested = sum(int(r["requested_contracts"] or 0) for r in rows)
+        return filled, requested, len(rows)
+
     def get_todays_spend(self) -> float:
         today = _now_iso()[:10]
         row = self._conn.execute(
@@ -929,6 +1047,6 @@ class Store:
                 ])
             writer.writerow([
                 logged_at, order.order_id, order.ticker, order.side, order.action, order.status,
-                order.count, order.fill_count, order.fill_cost,
+                order.count, order.fill_count, order.total_cost,
                 theo_prob, gross_edge, edge, fee, hours_to_expiry,
             ])

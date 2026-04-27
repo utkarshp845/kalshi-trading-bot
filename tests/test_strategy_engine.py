@@ -4,11 +4,21 @@ from bot.strategy_engine import decide_signal
 
 
 class _Store:
-    def __init__(self, edge_leaks=None, slippages=None, errors=None, realized_edges=None):
+    def __init__(
+        self,
+        edge_leaks=None,
+        slippages=None,
+        errors=None,
+        realized_edges=None,
+        bucket_stats=(None, 0),
+        maker_stats=(0, 0, 0),
+    ):
         self.edge_leaks = edge_leaks or []
         self.slippages = slippages or []
         self.errors = errors or []
         self.realized_edges = realized_edges or []
+        self.bucket_stats = bucket_stats
+        self.maker_stats = maker_stats
 
     def get_recent_edge_leaks(self, symbol, n, before_iso=None):
         return self.edge_leaks[:n]
@@ -21,6 +31,12 @@ class _Store:
 
     def get_recent_settled_abs_errors(self, symbol, n, before_iso=None):
         return self.errors[:n]
+
+    def get_bucket_realized_stats(self, **kwargs):
+        return self.bucket_stats
+
+    def get_maker_fill_stats(self, symbol, n, before_iso=None):
+        return self.maker_stats
 
 
 def _source() -> SourceSnapshot:
@@ -154,3 +170,35 @@ def test_live_mode_rejects_degraded_asset():
     decision = decide_signal(_Store(), asset, _feature(edge=0.40), held_tickers=set(), trading_mode="live")
     assert decision.eligible is False
     assert decision.reject_reason == "degraded_asset"
+
+
+def test_live_mode_rejects_negative_realized_bucket(monkeypatch):
+    import bot.config as cfg
+
+    monkeypatch.setattr(cfg, "BUCKET_EDGE_MIN_TRADES", 3)
+    store = _Store(bucket_stats=(-0.03, 4), realized_edges=[0.10] * 20, errors=[0.05] * 20)
+    decision = decide_signal(store, _asset(), _feature(edge=0.40), held_tickers=set(), trading_mode="live")
+
+    assert decision.eligible is False
+    assert decision.reject_reason == "negative_bucket_realized_edge"
+    assert decision.bucket_avg_realized_edge == -0.03
+    assert decision.bucket_sample_size == 4
+
+
+def test_live_mode_scales_score_by_maker_fill_probability(monkeypatch):
+    import bot.config as cfg
+
+    monkeypatch.setattr(cfg, "LIVE_MIN_REQUIRED_EDGE", 0.10)
+    monkeypatch.setattr(cfg, "COLD_START_MIN_EDGE", 0.10)
+    monkeypatch.setattr(cfg, "MAKER_FILL_MIN_ATTEMPTS", 2)
+    monkeypatch.setattr(cfg, "MAKER_MISS_PENALTY", 0.01)
+    store = _Store(
+        realized_edges=[0.10] * 20,
+        errors=[0.05] * 20,
+        maker_stats=(2, 10, 3),
+    )
+
+    decision = decide_signal(store, _asset(), _feature(edge=0.40), held_tickers=set(), trading_mode="live")
+
+    assert decision.maker_fill_prob == 0.2
+    assert decision.score < decision.realized_edge_proxy

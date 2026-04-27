@@ -34,7 +34,8 @@ KALSHI_PRIVATE_KEY_PATH: Path = Path(_require("KALSHI_PRIVATE_KEY_PATH"))
 KALSHI_BASE_URL: str = os.getenv(
     "KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"
 )
-KALSHI_TAKER_FEE: float = _float("KALSHI_TAKER_FEE", 0.07)  # dollars per contract
+KALSHI_TAKER_FEE: float = _float("KALSHI_TAKER_FEE", 0.07)  # taker fee coefficient: fee = 0.07 * contracts * price * (1-price)
+KALSHI_MAKER_FEE: float = _float("KALSHI_MAKER_FEE", 0.0175)  # maker fee coefficient where maker fees apply
 
 # --- Underlyings ---
 # Each enabled underlying is scanned independently per cycle. Signals are then
@@ -82,6 +83,13 @@ LIVE_GUARD_LOOKBACK_SETTLED: int = _int("LIVE_GUARD_LOOKBACK_SETTLED", 20)
 LIVE_HALT_MAX_AVG_REALIZED_EDGE: float = _float("LIVE_HALT_MAX_AVG_REALIZED_EDGE", 0.0)
 LIVE_HALT_MAX_SETTLED_MAE: float = _float("LIVE_HALT_MAX_SETTLED_MAE", 0.20)
 LIVE_SKIP_DEGRADED_ASSETS: bool = _bool("LIVE_SKIP_DEGRADED_ASSETS", True)
+BUCKET_EDGE_MIN_TRADES: int = _int("BUCKET_EDGE_MIN_TRADES", 8)
+BUCKET_EDGE_LOOKBACK_DAYS: int = _int("BUCKET_EDGE_LOOKBACK_DAYS", 21)
+BUCKET_EDGE_MIN_AVG_REALIZED: float = _float("BUCKET_EDGE_MIN_AVG_REALIZED", 0.0)
+MAKER_FILL_LOOKBACK_ATTEMPTS: int = _int("MAKER_FILL_LOOKBACK_ATTEMPTS", 40)
+MAKER_FILL_MIN_ATTEMPTS: int = _int("MAKER_FILL_MIN_ATTEMPTS", 8)
+DEFAULT_MAKER_FILL_PROB: float = _float("DEFAULT_MAKER_FILL_PROB", 0.50)
+MAKER_MISS_PENALTY: float = _float("MAKER_MISS_PENALTY", 0.01)
 
 # --- Risk ---
 DAILY_SPEND_PCT: float = _float("DAILY_SPEND_PCT", 0.15)      # was 0.10 — 15% of balance per day

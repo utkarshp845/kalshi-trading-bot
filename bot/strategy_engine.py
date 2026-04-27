@@ -30,6 +30,76 @@ def _uncertainty_penalty(store, symbol: str, before_iso: Optional[str] = None) -
     return max(0.01, sum(errors) / len(errors)) if errors else cfg.DEFAULT_UNCERTAINTY_PENALTY
 
 
+def _bucket_label(feature: MarketFeature) -> dict[str, str]:
+    prob = feature.contract_theo_prob
+    if prob < 0.35:
+        prob_bucket = "p25_35"
+    elif prob < 0.50:
+        prob_bucket = "p35_50"
+    elif prob <= 0.65:
+        prob_bucket = "p50_65"
+    else:
+        prob_bucket = "p65_75"
+
+    if feature.hours_to_expiry < 2:
+        time_bucket = "t1_2h"
+    elif feature.hours_to_expiry < 6:
+        time_bucket = "t2_6h"
+    else:
+        time_bucket = "t6h_plus"
+
+    if feature.spread_pct < 0.08:
+        spread_bucket = "spread_tight"
+    elif feature.spread_pct < 0.15:
+        spread_bucket = "spread_mid"
+    else:
+        spread_bucket = "spread_wide"
+
+    if feature.distance_from_spot_sigma < 0.5:
+        sigma_bucket = "sigma_near"
+    elif feature.distance_from_spot_sigma < 1.0:
+        sigma_bucket = "sigma_mid"
+    else:
+        sigma_bucket = "sigma_far"
+
+    return {
+        "side": feature.side,
+        "prob_bucket": prob_bucket,
+        "time_bucket": time_bucket,
+        "spread_bucket": spread_bucket,
+        "sigma_bucket": sigma_bucket,
+    }
+
+
+def _bucket_realized_stats(
+    store,
+    symbol: str,
+    feature: MarketFeature,
+    before_iso: Optional[str] = None,
+) -> tuple[Optional[float], int]:
+    if not hasattr(store, "get_bucket_realized_stats"):
+        return None, 0
+    return store.get_bucket_realized_stats(
+        symbol=symbol,
+        before_iso=before_iso,
+        lookback_days=cfg.BUCKET_EDGE_LOOKBACK_DAYS,
+        **_bucket_label(feature),
+    )
+
+
+def _maker_fill_probability(store, symbol: str, before_iso: Optional[str] = None) -> Optional[float]:
+    if not cfg.ENABLE_MAKER_ORDERS or not hasattr(store, "get_maker_fill_stats"):
+        return None
+    filled, requested, attempts = store.get_maker_fill_stats(
+        symbol=symbol,
+        n=cfg.MAKER_FILL_LOOKBACK_ATTEMPTS,
+        before_iso=before_iso,
+    )
+    if attempts < cfg.MAKER_FILL_MIN_ATTEMPTS or requested <= 0:
+        return cfg.DEFAULT_MAKER_FILL_PROB
+    return max(0.0, min(1.0, filled / requested))
+
+
 def decide_signal(
     store,
     asset: AssetSnapshot,
@@ -59,6 +129,13 @@ def decide_signal(
         sum(recent_settled_errors) / len(recent_settled_errors)
         if recent_settled_errors else None
     )
+    bucket_avg_realized, bucket_sample_size = _bucket_realized_stats(
+        store,
+        asset.symbol,
+        feature,
+        before_iso=before_iso,
+    )
+    maker_fill_prob = _maker_fill_probability(store, asset.symbol, before_iso=before_iso)
 
     if trading_mode == "live":
         required_edge = max(required_edge, cfg.LIVE_MIN_REQUIRED_EDGE)
@@ -71,7 +148,11 @@ def decide_signal(
 
     realized_edge_proxy = feature.edge - expected_slippage - uncertainty_penalty - feature.depth_slippage
     imbalance_boost = feature.orderbook_imbalance * cfg.IMBALANCE_SCORE_WEIGHT if feature.orderbook_available else 0.0
-    score = realized_edge_proxy + imbalance_boost
+    raw_score = realized_edge_proxy + imbalance_boost
+    if trading_mode == "live" and maker_fill_prob is not None:
+        score = raw_score * maker_fill_prob - cfg.MAKER_MISS_PENALTY * (1.0 - maker_fill_prob)
+    else:
+        score = raw_score
 
     reject_reason = ""
     if not asset.tradeable:
@@ -96,6 +177,13 @@ def decide_signal(
         and avg_recent_error > cfg.LIVE_HALT_MAX_SETTLED_MAE
     ):
         reject_reason = "high_recent_model_error"
+    elif (
+        trading_mode == "live"
+        and bucket_sample_size >= cfg.BUCKET_EDGE_MIN_TRADES
+        and bucket_avg_realized is not None
+        and bucket_avg_realized <= cfg.BUCKET_EDGE_MIN_AVG_REALIZED
+    ):
+        reject_reason = "negative_bucket_realized_edge"
     elif feature.ticker in held_tickers:
         reject_reason = "already_held"
     elif feature.hours_to_expiry < cfg.MIN_T_HOURS:
@@ -149,4 +237,7 @@ def decide_signal(
         depth_slippage=feature.depth_slippage,
         orderbook_imbalance=feature.orderbook_imbalance,
         orderbook_available=feature.orderbook_available,
+        bucket_avg_realized_edge=bucket_avg_realized,
+        bucket_sample_size=bucket_sample_size,
+        maker_fill_prob=maker_fill_prob,
     )

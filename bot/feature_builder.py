@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Optional
 
 import bot.config as cfg
+from bot.fees import fee_per_contract
 from bot.implied_vol import fit_cycle_iv
 from bot.kalshi_client import Market
 from bot.models import AssetSnapshot, MarketFeature
@@ -111,18 +112,22 @@ def build_market_features(
         yes_theo = calc_prob(asset.spot, strike, T_years, asset.sigma_adjusted, mu=asset.mu)
         no_theo = 1.0 - yes_theo
 
-        # Maker orders fill at the bid with $0 fee; taker orders fill at ask and pay the fee.
+        # Maker orders fill at the bid; taker orders fill at ask. Fees are
+        # computed with Kalshi's price-dependent formula for a one-contract
+        # signal estimate and rechecked at exact order size before execution.
         if maker_entry:
             yes_gross = yes_theo - market.yes_bid
             no_gross = no_theo - market.no_bid
-            effective_fee = 0.0
+            yes_fee = fee_per_contract(market.yes_bid, 1, cfg.KALSHI_MAKER_FEE)
+            no_fee = fee_per_contract(market.no_bid, 1, cfg.KALSHI_MAKER_FEE)
         else:
             yes_gross = yes_theo - market.yes_ask
             no_gross = no_theo - market.no_ask
-            effective_fee = fee
+            yes_fee = fee_per_contract(market.yes_ask, 1, fee)
+            no_fee = fee_per_contract(market.no_ask, 1, fee)
 
-        yes_net = yes_gross - effective_fee
-        no_net = no_gross - effective_fee
+        yes_net = yes_gross - yes_fee
+        no_net = no_gross - no_fee
 
         side = "yes" if yes_net >= no_net else "no"
         ask = market.yes_ask if side == "yes" else market.no_ask
@@ -168,7 +173,7 @@ def build_market_features(
             "spread_pct": spread_pct,
             "gross_edge": yes_gross if side == "yes" else no_gross,
             "edge": yes_net if side == "yes" else no_net,
-            "fee": effective_fee,
+            "fee": yes_fee if side == "yes" else no_fee,
             "hours_to_expiry": hours,
             "distance_from_spot_sigma": sigma_distance,
             "last_price_divergence": (

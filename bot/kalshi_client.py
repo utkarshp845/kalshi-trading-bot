@@ -193,6 +193,10 @@ class Order:
     def fees(self) -> float:
         return self.taker_fees + self.maker_fees
 
+    @property
+    def total_cost(self) -> float:
+        return self.fill_cost + self.fees
+
     @classmethod
     def from_dict(cls, d: dict) -> "Order":
         return cls(

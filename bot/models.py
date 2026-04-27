@@ -108,6 +108,9 @@ class SignalDecision:
     depth_slippage: float = 0.0
     orderbook_imbalance: float = 0.0
     orderbook_available: bool = False
+    bucket_avg_realized_edge: Optional[float] = None
+    bucket_sample_size: int = 0
+    maker_fill_prob: Optional[float] = None
 
     @property
     def cost_estimate(self) -> float:

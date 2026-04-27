@@ -11,6 +11,8 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import bot.config as cfg
+from bot.fees import fee_per_contract
 from bot.kalshi_client import Market
 from bot.pricing import calc_prob
 
@@ -122,20 +124,23 @@ def evaluate(
     yes_theo_prob = calc_prob(spot_price, strike, T_years, sigma, mu=mu)
     no_theo_prob = 1.0 - yes_theo_prob
 
-    # Maker fills at bid with $0 fee; taker crosses the spread and pays the fee.
+    # Maker fills at bid; taker crosses the spread. Fees use Kalshi's
+    # price-dependent formula for a one-contract signal estimate.
     if maker_entry:
         entry_yes = market.yes_bid
         entry_no = market.no_bid
-        effective_fee = 0.0
+        fee_yes = fee_per_contract(entry_yes, 1, cfg.KALSHI_MAKER_FEE)
+        fee_no = fee_per_contract(entry_no, 1, cfg.KALSHI_MAKER_FEE)
     else:
         entry_yes = market.yes_ask
         entry_no = market.no_ask
-        effective_fee = fee
+        fee_yes = fee_per_contract(entry_yes, 1, fee)
+        fee_no = fee_per_contract(entry_no, 1, fee)
 
     gross_yes = yes_theo_prob - entry_yes
     gross_no = no_theo_prob - entry_no
-    net_yes = gross_yes - effective_fee
-    net_no = gross_no - effective_fee
+    net_yes = gross_yes - fee_yes
+    net_no = gross_no - fee_no
 
     log.debug(
         "%s K=%.0f S=%.0f T=%.2fh σ=%.4f → theo=%.4f  "
@@ -165,6 +170,7 @@ def evaluate(
     mid = yes_mid if best_side == "yes" else no_mid
     bid = market.yes_bid if best_side == "yes" else market.no_bid
     contract_theo_prob = yes_theo_prob if best_side == "yes" else no_theo_prob
+    signal_fee = fee_yes if best_side == "yes" else fee_no
 
     return Signal(
         ticker=market.ticker,
@@ -172,7 +178,7 @@ def evaluate(
         price=ask_price,
         gross_edge=best_gross,
         edge=best_net,
-        fee=effective_fee,
+        fee=signal_fee,
         theo_prob=contract_theo_prob,
         strike=strike,
         mid_price=mid,
