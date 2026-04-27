@@ -1,8 +1,11 @@
 """Tests for bot/store.py — persistence layer using in-memory SQLite."""
+import sqlite3
+
 import pytest
 from pathlib import Path
 from bot.store import Store
 from bot.kalshi_client import Order
+from bot.models import SignalDecision
 
 
 @pytest.fixture
@@ -235,6 +238,95 @@ class TestMigrations:
         ).fetchone()
         assert row["theo_prob"] == pytest.approx(0.82)
         assert row["realized_edge"] == pytest.approx(0.82 - 0.50 - 0.07)
+
+    def test_adds_bucket_columns_to_existing_signal_decisions_table(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE signal_decisions (
+                cycle_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                eligible INTEGER,
+                score REAL,
+                required_edge REAL,
+                expected_slippage REAL,
+                uncertainty_penalty REAL,
+                realized_edge_proxy REAL,
+                reject_reason TEXT,
+                theo_prob REAL,
+                ask REAL,
+                bid REAL,
+                mid_price REAL,
+                gross_edge REAL,
+                edge REAL,
+                fee REAL,
+                hours_to_expiry REAL,
+                strike REAL,
+                distance_from_spot_sigma REAL,
+                degraded INTEGER,
+                chain_break_ratio REAL,
+                top_of_book_size REAL,
+                resting_size_at_entry REAL,
+                cumulative_size_at_entry REAL,
+                expected_fill_price REAL,
+                depth_slippage REAL,
+                orderbook_imbalance REAL,
+                orderbook_available INTEGER,
+                logged_at TEXT NOT NULL,
+                PRIMARY KEY (cycle_id, ticker, side)
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        s = Store(db_path=db_path, trades_csv_path=tmp_path / "trades.csv")
+        s.open()
+        try:
+            cols = {row[1] for row in s._conn.execute("PRAGMA table_info(signal_decisions)").fetchall()}
+            assert "bucket_avg_realized_edge" in cols
+            assert "bucket_sample_size" in cols
+            assert "maker_fill_prob" in cols
+
+            s.log_signal_decision(
+                "cycle-1",
+                SignalDecision(
+                    symbol="BTC",
+                    ticker="KXBTC-26APR4PM-B95000",
+                    side="yes",
+                    eligible=False,
+                    score=0.01,
+                    required_edge=0.20,
+                    expected_slippage=0.01,
+                    uncertainty_penalty=0.01,
+                    realized_edge_proxy=0.01,
+                    reject_reason="edge_below_hurdle",
+                    theo_prob=0.60,
+                    ask=0.45,
+                    bid=0.42,
+                    mid_price=0.435,
+                    gross_edge=0.15,
+                    edge=0.13,
+                    fee=0.02,
+                    hours_to_expiry=4.0,
+                    strike=95000.0,
+                    distance_from_spot_sigma=0.5,
+                    degraded=False,
+                    chain_break_ratio=0.0,
+                    bucket_avg_realized_edge=-0.01,
+                    bucket_sample_size=12,
+                    maker_fill_prob=0.4,
+                ),
+            )
+            row = s._conn.execute(
+                "SELECT bucket_avg_realized_edge, bucket_sample_size, maker_fill_prob FROM signal_decisions"
+            ).fetchone()
+            assert row["bucket_avg_realized_edge"] == pytest.approx(-0.01)
+            assert row["bucket_sample_size"] == 12
+            assert row["maker_fill_prob"] == pytest.approx(0.4)
+        finally:
+            s.close()
 
 
 class TestGetSlippageFactor:

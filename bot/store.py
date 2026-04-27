@@ -316,6 +316,9 @@ class Store:
             "depth_slippage": "REAL",
             "orderbook_imbalance": "REAL",
             "orderbook_available": "INTEGER",
+            "bucket_avg_realized_edge": "REAL",
+            "bucket_sample_size": "INTEGER",
+            "maker_fill_prob": "REAL",
         }
         existing_signal_decisions = {
             row[1]
@@ -579,6 +582,17 @@ class Store:
         self._conn.commit()
 
     def log_signal_decision(self, cycle_id: str, decision: SignalDecision) -> None:
+        try:
+            self._insert_signal_decision(cycle_id, decision)
+        except sqlite3.OperationalError as exc:
+            if "signal_decisions" not in str(exc) and "no column named" not in str(exc):
+                raise
+            log.warning("Signal decision insert hit old schema (%s); running migration and retrying", exc)
+            self._migrate()
+            self._insert_signal_decision(cycle_id, decision)
+        self._conn.commit()
+
+    def _insert_signal_decision(self, cycle_id: str, decision: SignalDecision) -> None:
         self._conn.execute("""
             INSERT OR REPLACE INTO signal_decisions
               (cycle_id, symbol, ticker, side, eligible, score, required_edge,
@@ -602,7 +616,6 @@ class Store:
             decision.bucket_avg_realized_edge, decision.bucket_sample_size,
             decision.maker_fill_prob, _now_iso(),
         ))
-        self._conn.commit()
 
     def upsert_market_outcome(
         self,
