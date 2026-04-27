@@ -72,3 +72,55 @@ def test_degraded_symbol_cap_reduces_size():
 def test_symbol_position_cap_blocks_new_trade():
     risk = _risk()
     assert risk.can_trade_symbol("BTC", {"BTC": 1}) is False
+
+
+def test_sizing_accounts_for_fee_rounding_in_budget():
+    risk = PortfolioRisk(
+        daily_spend_pct=0.0,
+        daily_spend_floor=1.02,
+        max_contracts_per_market=10,
+        max_positions=3,
+        max_symbol_daily_spend_pct=0.0,
+        max_symbol_positions=3,
+        kelly_fraction=10.0,
+        max_drawdown_pct=0.20,
+        bankroll_fraction=1.0,
+    )
+    risk.set_session_balance(10.0)
+
+    decision = _decision()
+    decision = SignalDecision(
+        **{
+            **decision.__dict__,
+            "theo_prob": 0.99,
+            "ask": 0.50,
+            "bid": 0.50,
+            "gross_edge": 0.49,
+            "edge": 0.47,
+            "fee": 0.02,
+            "cumulative_size_at_entry": 0.0,
+        }
+    )
+
+    # Two 50-cent maker contracts cost 1.00 before fees and 1.01 after rounded fees.
+    assert risk.size_order(decision, current_balance=10.0, open_positions_by_symbol={}) == 2
+
+
+def test_sizing_rejects_negative_expected_growth_even_if_edge_field_is_positive():
+    risk = _risk()
+    decision = _decision()
+    decision = SignalDecision(
+        **{
+            **decision.__dict__,
+            "theo_prob": 0.505,
+            "ask": 0.50,
+            "bid": 0.50,
+            "gross_edge": 0.005,
+            "edge": 0.005,
+            "fee": 0.02,
+            "cumulative_size_at_entry": 0.0,
+        }
+    )
+
+    assert risk.size_order(decision, current_balance=1000.0, open_positions_by_symbol={}) == 0
+    assert risk.last_size_reason == "non_positive_growth"
