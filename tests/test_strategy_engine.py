@@ -105,7 +105,7 @@ def test_decision_rejects_outside_probability_band():
 
 
 def test_decision_rejects_sigma_distance():
-    decision = decide_signal(_Store(), _asset(), _feature(distance_from_spot_sigma=2.0), held_tickers=set())
+    decision = decide_signal(_Store(), _asset(), _feature(distance_from_spot_sigma=2.5), held_tickers=set())
     assert decision.eligible is False
     assert decision.reject_reason == "sigma_distance"
 
@@ -136,10 +136,11 @@ def test_decision_rejects_when_depth_slippage_erases_edge():
 
 
 def test_live_mode_requires_higher_cold_start_edge():
-    decision = decide_signal(_Store(), _asset(), _feature(edge=0.26), held_tickers=set(), trading_mode="live")
+    # In cold start (0 fills), required_edge interpolates up to COLD_START_MIN_EDGE (0.06)
+    decision = decide_signal(_Store(), _asset(), _feature(edge=0.03), held_tickers=set(), trading_mode="live")
     assert decision.eligible is False
     assert decision.reject_reason == "edge_below_hurdle"
-    assert decision.required_edge >= 0.30
+    assert decision.required_edge >= 0.06
 
 
 def test_live_mode_rejects_negative_recent_realized_edge():
