@@ -44,11 +44,11 @@ ENABLE_BTC: bool = _bool("ENABLE_BTC", True)
 ENABLE_ETH: bool = _bool("ENABLE_ETH", True)
 
 # --- Strategy ---
-MIN_EDGE: float = _float("MIN_EDGE", 0.05)          # net edge required after fees; 0.05 is realistic for liquid BTC markets
+MIN_EDGE: float = _float("MIN_EDGE", 0.04)          # was 0.05 — widen opportunity set; aggressive-risk mode
 TRADING_MODE: str = os.getenv("TRADING_MODE", "observe").strip().lower()
 USE_DRIFT: bool = _bool("USE_DRIFT", False)         # 30-day trailing drift is too noisy to be reliable signal; disabled by default
 DRIFT_LOOKBACK_DAYS: int = _int("DRIFT_LOOKBACK_DAYS", 30)  # window for the trailing log-return drift estimate
-MIN_T_HOURS: float = _float("MIN_T_HOURS", 1.0)     # was 0.5 — avoid noisy near-expiry markets
+MIN_T_HOURS: float = _float("MIN_T_HOURS", 0.5)     # was 1.0 — allow closer-to-expiry markets for more frequent signals
 VOL_SHORT_DAYS: int = _int("VOL_SHORT_DAYS", 7)      # fast vol: used for signal probability
 VOL_LONG_DAYS: int = _int("VOL_LONG_DAYS", 30)       # slow vol: logged as regime reference
 VOL_SAFETY_MARGIN: float = _float("VOL_SAFETY_MARGIN", 1.05)  # was 1.25 — slight inflation only; over-inflating hides real edge
@@ -57,32 +57,32 @@ MIN_BID_ASK_SPREAD: float = _float("MIN_BID_ASK_SPREAD", 0.0)   # minimum accept
 MAX_BID_ASK_SPREAD: float = _float("MAX_BID_ASK_SPREAD", 0.12)  # skip markets where ask-bid > this (wide spread = phantom edge)
 MAX_BID_ASK_PCT_SPREAD: float = _float("MAX_BID_ASK_PCT_SPREAD", 0.20)  # skip if spread > 20% of mid-price (relative illiquidity filter)
 MAX_LAST_PRICE_DIVERGENCE: float = _float("MAX_LAST_PRICE_DIVERGENCE", 0.20)  # skip if last_price diverges > 0.20 from yes_mid (stale/moving market)
-THEO_PROB_BAND_MIN: float = _float("THEO_PROB_BAND_MIN", 0.20)
-THEO_PROB_BAND_MAX: float = _float("THEO_PROB_BAND_MAX", 0.80)
+THEO_PROB_BAND_MIN: float = _float("THEO_PROB_BAND_MIN", 0.10)  # was 0.20 — scan further OTM strikes for more signals
+THEO_PROB_BAND_MAX: float = _float("THEO_PROB_BAND_MAX", 0.90)  # was 0.80
 MIN_SANE_STRIKES: int = _int("MIN_SANE_STRIKES", 2)          # min liquid strikes per expiry chain; was hardcoded 4
-MAX_SIGMA_DISTANCE: float = _float("MAX_SIGMA_DISTANCE", 2.0)
+MAX_SIGMA_DISTANCE: float = _float("MAX_SIGMA_DISTANCE", 3.0)  # was 2.0 — scan more strikes per expiry
 MAX_CHAIN_BREAK_PCT: float = _float("MAX_CHAIN_BREAK_PCT", 0.10)
 IMBALANCE_SCORE_WEIGHT: float = _float("IMBALANCE_SCORE_WEIGHT", 0.03)  # orderbook imbalance contribution to signal score; max ±0.03
 EDGE_LEAK_LOOKBACK_FILLS: int = _int("EDGE_LEAK_LOOKBACK_FILLS", 50)
-EDGE_HURDLE_BUFFER: float = _float("EDGE_HURDLE_BUFFER", 0.02)
+EDGE_HURDLE_BUFFER: float = _float("EDGE_HURDLE_BUFFER", 0.015)  # was 0.02 — slightly less conservative once fill history exists
 SETTLED_MAE_LOOKBACK_TRADES: int = _int("SETTLED_MAE_LOOKBACK_TRADES", 30)
-DEFAULT_EXPECTED_SLIPPAGE: float = _float("DEFAULT_EXPECTED_SLIPPAGE", 0.03)
-DEFAULT_UNCERTAINTY_PENALTY: float = _float("DEFAULT_UNCERTAINTY_PENALTY", 0.05)
-MAX_DEPTH_SLIPPAGE_PER_CONTRACT: float = _float("MAX_DEPTH_SLIPPAGE_PER_CONTRACT", 0.02)
+DEFAULT_EXPECTED_SLIPPAGE: float = _float("DEFAULT_EXPECTED_SLIPPAGE", 0.015)  # was 0.03 — maker-first means real slippage is lower
+DEFAULT_UNCERTAINTY_PENALTY: float = _float("DEFAULT_UNCERTAINTY_PENALTY", 0.02)  # was 0.05 — less punishing before any fill history
+MAX_DEPTH_SLIPPAGE_PER_CONTRACT: float = _float("MAX_DEPTH_SLIPPAGE_PER_CONTRACT", 0.035)  # was 0.02 — allow trading thinner books
 LIQUIDITY_ENTRY_MULTIPLIER: float = _float("LIQUIDITY_ENTRY_MULTIPLIER", 5.0)
 ORDERBOOK_DEPTH: int = _int("ORDERBOOK_DEPTH", 20)
 DATA_STALE_AFTER_SEC_KRAKEN: int = _int("DATA_STALE_AFTER_SEC_KRAKEN", 20)
 DATA_STALE_AFTER_SEC_KALSHI: int = _int("DATA_STALE_AFTER_SEC_KALSHI", 20)
 DATA_STALE_AFTER_SEC_DERIBIT: int = _int("DATA_STALE_AFTER_SEC_DERIBIT", 120)
-LIVE_MIN_REQUIRED_EDGE: float = _float("LIVE_MIN_REQUIRED_EDGE", 0.10)
-COLD_START_MIN_EDGE: float = _float("COLD_START_MIN_EDGE", 0.15)
+LIVE_MIN_REQUIRED_EDGE: float = _float("LIVE_MIN_REQUIRED_EDGE", 0.04)  # was 0.06 — aggressive mode, trade more marginal edges
+COLD_START_MIN_EDGE: float = _float("COLD_START_MIN_EDGE", 0.04)  # was 0.06 — match LIVE_MIN_REQUIRED_EDGE so cold start isn't a separate hurdle
 LIVE_MIN_FILL_HISTORY: int = _int("LIVE_MIN_FILL_HISTORY", 8)
 LIVE_MIN_SETTLED_HISTORY: int = _int("LIVE_MIN_SETTLED_HISTORY", 10)
 LIVE_GUARD_LOOKBACK_FILLS: int = _int("LIVE_GUARD_LOOKBACK_FILLS", 20)
 LIVE_GUARD_LOOKBACK_SETTLED: int = _int("LIVE_GUARD_LOOKBACK_SETTLED", 20)
 LIVE_HALT_MAX_AVG_REALIZED_EDGE: float = _float("LIVE_HALT_MAX_AVG_REALIZED_EDGE", 0.0)
 LIVE_HALT_MAX_SETTLED_MAE: float = _float("LIVE_HALT_MAX_SETTLED_MAE", 0.20)
-LIVE_SKIP_DEGRADED_ASSETS: bool = _bool("LIVE_SKIP_DEGRADED_ASSETS", True)
+LIVE_SKIP_DEGRADED_ASSETS: bool = _bool("LIVE_SKIP_DEGRADED_ASSETS", False)  # was True — degraded assets already get a 0.5x size cut; don't skip entirely
 BUCKET_EDGE_MIN_TRADES: int = _int("BUCKET_EDGE_MIN_TRADES", 8)
 BUCKET_EDGE_LOOKBACK_DAYS: int = _int("BUCKET_EDGE_LOOKBACK_DAYS", 21)
 BUCKET_EDGE_MIN_AVG_REALIZED: float = _float("BUCKET_EDGE_MIN_AVG_REALIZED", 0.0)
@@ -94,13 +94,13 @@ MAKER_MISS_PENALTY: float = _float("MAKER_MISS_PENALTY", 0.01)
 # --- Risk ---
 DAILY_SPEND_PCT: float = _float("DAILY_SPEND_PCT", 0.15)      # was 0.10 — 15% of balance per day
 DAILY_SPEND_FLOOR: float = _float("DAILY_SPEND_FLOOR", 5.0)   # minimum daily cap regardless of balance
-MAX_CONTRACTS_PER_MARKET: int = _int("MAX_CONTRACTS_PER_MARKET", 15)  # was 3 — 3 contracts = $3 max payout, too small
+MAX_CONTRACTS_PER_MARKET: int = _int("MAX_CONTRACTS_PER_MARKET", 25)  # was 15 — allow bigger single-market positions
 MAX_POSITIONS: int = _int("MAX_POSITIONS", 5)              # was 2 — allows more diversification across strikes
 MAX_SYMBOL_DAILY_SPEND_PCT: float = _float("MAX_SYMBOL_DAILY_SPEND_PCT", 0.08)
 MAX_SYMBOL_POSITIONS: int = _int("MAX_SYMBOL_POSITIONS", 3)
-KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.20)    # was 0.10 — stacked discounts reduced to near-zero; raised
+KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.40)    # was 0.30 — aggressive-risk mode; bigger bets per signal
 MAX_DRAWDOWN_PCT: float = _float("MAX_DRAWDOWN_PCT", 0.20)  # stop trading if account drops 20% from session start
-BANKROLL_FRACTION: float = _float("BANKROLL_FRACTION", 0.40)  # was 0.25 — allow more of balance to be deployed
+BANKROLL_FRACTION: float = _float("BANKROLL_FRACTION", 0.50)  # was 0.40 — allow more of balance to be deployed
 CORRELATION_DISCOUNT_FACTOR: float = _float("CORRELATION_DISCOUNT_FACTOR", 0.85)  # was hardcoded 0.70 — 0.70^n was too aggressive
 
 # --- Implied Vol Calibration ---
