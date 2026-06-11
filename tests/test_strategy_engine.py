@@ -99,13 +99,13 @@ def _feature(**kwargs) -> MarketFeature:
 
 
 def test_decision_rejects_outside_probability_band():
-    decision = decide_signal(_Store(), _asset(), _feature(contract_theo_prob=0.90), held_tickers=set())
+    decision = decide_signal(_Store(), _asset(), _feature(contract_theo_prob=0.95), held_tickers=set())
     assert decision.eligible is False
     assert decision.reject_reason == "prob_band"
 
 
 def test_decision_rejects_sigma_distance():
-    decision = decide_signal(_Store(), _asset(), _feature(distance_from_spot_sigma=2.5), held_tickers=set())
+    decision = decide_signal(_Store(), _asset(), _feature(distance_from_spot_sigma=3.5), held_tickers=set())
     assert decision.eligible is False
     assert decision.reject_reason == "sigma_distance"
 
@@ -128,7 +128,7 @@ def test_decision_rejects_when_depth_slippage_erases_edge():
     decision = decide_signal(
         _Store(),
         _asset(),
-        _feature(edge=0.18, depth_slippage=0.03, expected_fill_price=0.48, orderbook_available=True),
+        _feature(edge=0.18, depth_slippage=0.04, expected_fill_price=0.48, orderbook_available=True),
         held_tickers=set(),
     )
     assert decision.eligible is False
@@ -136,11 +136,11 @@ def test_decision_rejects_when_depth_slippage_erases_edge():
 
 
 def test_live_mode_requires_higher_cold_start_edge():
-    # In cold start (0 fills), required_edge interpolates up to COLD_START_MIN_EDGE (0.06)
-    decision = decide_signal(_Store(), _asset(), _feature(edge=0.03), held_tickers=set(), trading_mode="live")
+    # In cold start (0 fills), required_edge interpolates up to COLD_START_MIN_EDGE (0.04)
+    decision = decide_signal(_Store(), _asset(), _feature(edge=0.02), held_tickers=set(), trading_mode="live")
     assert decision.eligible is False
     assert decision.reject_reason == "edge_below_hurdle"
-    assert decision.required_edge >= 0.06
+    assert decision.required_edge >= 0.04
 
 
 def test_live_mode_rejects_negative_recent_realized_edge():
@@ -150,7 +150,13 @@ def test_live_mode_rejects_negative_recent_realized_edge():
     assert decision.reject_reason == "negative_recent_realized_edge"
 
 
-def test_live_mode_rejects_degraded_asset():
+def test_live_mode_rejects_degraded_asset_when_skip_enabled(monkeypatch):
+    import bot.config as cfg
+
+    # LIVE_SKIP_DEGRADED_ASSETS now defaults to False (aggressive mode lets
+    # degraded assets trade at reduced size via the portfolio risk discount),
+    # but the opt-in skip behavior must still work when explicitly enabled.
+    monkeypatch.setattr(cfg, "LIVE_SKIP_DEGRADED_ASSETS", True)
     asset = _asset()
     asset = AssetSnapshot(
         symbol=asset.symbol,
@@ -171,6 +177,29 @@ def test_live_mode_rejects_degraded_asset():
     decision = decide_signal(_Store(), asset, _feature(edge=0.40), held_tickers=set(), trading_mode="live")
     assert decision.eligible is False
     assert decision.reject_reason == "degraded_asset"
+
+
+def test_live_mode_allows_degraded_asset_by_default():
+    asset = _asset()
+    asset = AssetSnapshot(
+        symbol=asset.symbol,
+        series_ticker=asset.series_ticker,
+        spot=asset.spot,
+        sigma_short=asset.sigma_short,
+        sigma_long=asset.sigma_long,
+        sigma_adjusted=asset.sigma_adjusted,
+        mu=asset.mu,
+        iv_rv_ratio=asset.iv_rv_ratio,
+        adaptive_margin=asset.adaptive_margin,
+        spot_source=asset.spot_source,
+        markets_source=asset.markets_source,
+        iv_source=asset.iv_source,
+        degraded=True,
+        health_status=asset.health_status,
+    )
+    decision = decide_signal(_Store(), asset, _feature(edge=0.40), held_tickers=set(), trading_mode="live")
+    assert decision.eligible is True
+    assert decision.degraded is True
 
 
 def test_live_mode_rejects_negative_realized_bucket(monkeypatch):

@@ -94,12 +94,12 @@ def _setup_logging() -> None:
 # Trading hours guard
 # ------------------------------------------------------------------
 
-# BTC doesn't sleep — trade essentially the entire day. The window below covers
-# midnight ET (when new daily markets open and prices are least efficient) through
-# ~5 minutes before the 4pm ET daily close.
+# BTC doesn't sleep — trade essentially the entire day. Aggressive mode: stay
+# active nearly 24/7, only pausing for a brief buffer at the very end of the
+# ET day to avoid stale-quote fills right at rollover.
 _TRADING_START_HOUR = 0     # midnight ET — catch new market opens
-_TRADING_END_HOUR   = 15    # final partial hour before the 4pm close
-_TRADING_END_MINUTE = 55    # stop ~5 min before close to avoid stale-quote fills
+_TRADING_END_HOUR   = 23    # nearly all day
+_TRADING_END_MINUTE = 55    # stop ~5 min before midnight rollover
 
 
 def _is_trading_hours() -> bool:
