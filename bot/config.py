@@ -161,6 +161,12 @@ POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 60)   # was 120 — f
 # at most this many API fetches per cycle, so backfill can't eat the cycle budget.
 OUTCOME_BACKFILL_RETRY_SEC: float = _float("OUTCOME_BACKFILL_RETRY_SEC", 900.0)
 OUTCOME_BACKFILL_MAX_PER_CYCLE: int = _int("OUTCOME_BACKFILL_MAX_PER_CYCLE", 25)
+# Hard wall-clock budget for the backfill phase: the count cap alone doesn't help
+# when each fetch takes seconds (rate-limit backoff on the historical endpoint).
+OUTCOME_BACKFILL_TIME_BUDGET_SEC: float = _float("OUTCOME_BACKFILL_TIME_BUDGET_SEC", 15.0)
+# The daily report re-aggregates the whole day's tables — far too heavy to run
+# every cycle. Regenerate at most this often.
+REPORT_REFRESH_SEC: float = _float("REPORT_REFRESH_SEC", 900.0)
 DRY_RUN: bool = _bool("DRY_RUN", False)
 FORCE_TRADING_HOURS: bool = _bool("FORCE_TRADING_HOURS", False)
 

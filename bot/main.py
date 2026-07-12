@@ -82,10 +82,12 @@ class UnderlyingState:
 def _setup_logging() -> None:
     cfg.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     fmt = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
-    handlers: list[logging.Handler] = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(cfg.LOG_PATH),
-    ]
+    handlers: list[logging.Handler] = [logging.FileHandler(cfg.LOG_PATH)]
+    # Under systemd, stdout is already appended to the log file by the unit's
+    # StandardOutput= — adding a stream handler there duplicates every line.
+    # Only echo to stdout when running interactively.
+    if sys.stdout.isatty():
+        handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
@@ -280,6 +282,11 @@ def _check_fills(kalshi: KalshiClient, store: Store) -> None:
 # the API for every unlabeled ticker each cycle wastes most of the cycle budget.
 _outcome_backfill_next_attempt: dict[str, float] = {}
 
+# Report refresh state: last generation time and the UTC date it covered, so a
+# day rollover finalizes yesterday's report exactly once.
+_last_report_generated_at: float = 0.0
+_last_report_date: str = ""
+
 
 def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: str) -> None:
     candidates = store.get_unlabeled_market_tickers(before_iso=before_iso, limit=100)
@@ -287,7 +294,15 @@ def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: st
     tickers = [
         t for t in candidates if _outcome_backfill_next_attempt.get(t, 0.0) <= now
     ][: cfg.OUTCOME_BACKFILL_MAX_PER_CYCLE]
+    deadline = now + cfg.OUTCOME_BACKFILL_TIME_BUDGET_SEC
     for ticker in tickers:
+        if time.monotonic() > deadline:
+            log.info(
+                "Outcome backfill stopped at time budget (%.0fs) — %d ticker(s) deferred",
+                cfg.OUTCOME_BACKFILL_TIME_BUDGET_SEC,
+                len(tickers) - tickers.index(ticker),
+            )
+            break
         _outcome_backfill_next_attempt[ticker] = now + cfg.OUTCOME_BACKFILL_RETRY_SEC
         try:
             market = kalshi.get_historical_market(ticker)
@@ -1172,11 +1187,20 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         cycle_id=cycle_id,
     )
 
-    try:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        generate_report(today, cfg.DB_PATH, cfg.REPORTS_DIR)
-    except Exception as e:
-        log.warning("Daily report generation failed: %s", e)
+    # The report aggregates the entire day's tables — minutes of query time on a
+    # busy day. Refresh it on a timer instead of every cycle; the final version
+    # for the day is produced by the first refresh after midnight UTC anyway.
+    global _last_report_generated_at, _last_report_date
+    if time.monotonic() - _last_report_generated_at >= cfg.REPORT_REFRESH_SEC:
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if _last_report_date and _last_report_date != today:
+                generate_report(_last_report_date, cfg.DB_PATH, cfg.REPORTS_DIR)
+            generate_report(today, cfg.DB_PATH, cfg.REPORTS_DIR)
+            _last_report_generated_at = time.monotonic()
+            _last_report_date = today
+        except Exception as e:
+            log.warning("Daily report generation failed: %s", e)
 
     log.info("--- Cycle end: %d eligible signal(s), %d order(s) placed ---", len(eligible_decisions), orders_placed)
 

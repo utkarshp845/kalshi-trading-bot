@@ -240,6 +240,25 @@ class Store:
         """)
         # Migrate existing databases that predate the new columns
         self._migrate()
+        # High-churn tables gain ~200k+ rows/day at full cycle cadence; the daily
+        # report and backfill queries filter by day (substr(logged_at,1,10)) and
+        # close_time, which are full scans without these.
+        self._conn.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_signal_decisions_day
+                ON signal_decisions(substr(logged_at, 1, 10));
+            CREATE INDEX IF NOT EXISTS idx_execution_attempts_day
+                ON execution_attempts(substr(logged_at, 1, 10));
+            CREATE INDEX IF NOT EXISTS idx_orders_day
+                ON orders(substr(logged_at, 1, 10));
+            CREATE INDEX IF NOT EXISTS idx_runs_day
+                ON runs(substr(run_at, 1, 10));
+            CREATE INDEX IF NOT EXISTS idx_asset_runs_day
+                ON asset_runs(substr(run_at, 1, 10));
+            CREATE INDEX IF NOT EXISTS idx_market_snapshots_close_ticker
+                ON market_snapshots(close_time, ticker);
+            CREATE INDEX IF NOT EXISTS idx_market_snapshots_ticker
+                ON market_snapshots(ticker);
+        """)
         self._conn.commit()
 
     def _migrate(self) -> None:
