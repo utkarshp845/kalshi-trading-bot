@@ -134,3 +134,16 @@ def test_market_features_maker_entry_uses_bid_and_maker_fee():
     # Taker: fee is price-dependent, not a flat 7 cents
     assert taker_feature.fee == pytest.approx(0.02)
     assert taker_feature.gross_edge == pytest.approx(taker_feature.edge + taker_feature.fee)
+
+
+def test_spread_ok_waives_pct_test_for_tight_absolute_spreads():
+    from bot.feature_builder import _spread_ok
+
+    # Cheap OTM lottery contract: 2c absolute spread but 50% pct spread — tradeable
+    assert _spread_ok(bid=0.03, ask=0.05) is True
+    # Tight spread right at the waiver threshold
+    assert _spread_ok(bid=0.02, ask=0.07) is True
+    # Above the waiver, pct test applies again: 6c spread on a 9c mid fails
+    assert _spread_ok(bid=0.06, ask=0.12) is False
+    # Absolute cap still binds regardless of price level
+    assert _spread_ok(bid=0.40, ask=0.60) is False

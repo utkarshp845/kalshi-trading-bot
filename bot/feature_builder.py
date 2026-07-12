@@ -26,7 +26,13 @@ def _pct_spread(bid: float, ask: float) -> float:
 
 def _spread_ok(bid: float, ask: float) -> bool:
     spread = ask - bid
-    return spread <= cfg.MAX_BID_ASK_SPREAD and _pct_spread(bid, ask) <= cfg.MAX_BID_ASK_PCT_SPREAD
+    if spread > cfg.MAX_BID_ASK_SPREAD:
+        return False
+    # Pct-spread test is waived for tight absolute spreads: cheap OTM contracts
+    # (bid 3c / ask 5c) always fail a relative test despite being tradeable.
+    if spread <= cfg.SPREAD_PCT_EXEMPT_ABS:
+        return True
+    return _pct_spread(bid, ask) <= cfg.MAX_BID_ASK_PCT_SPREAD
 
 
 def build_asset_snapshot(

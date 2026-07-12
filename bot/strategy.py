@@ -101,9 +101,15 @@ def evaluate(
     no_mid = (market.no_ask + market.no_bid) / 2
     yes_pct = yes_spread / yes_mid if yes_mid > 0.01 else 99.0
     no_pct = no_spread / no_mid if no_mid > 0.01 else 99.0
-    # A side is tradeable only if it passes both absolute and percentage spread tests
-    yes_ok = yes_spread <= max_bid_ask_spread and yes_pct <= max_bid_ask_pct_spread
-    no_ok = no_spread <= max_bid_ask_spread and no_pct <= max_bid_ask_pct_spread
+    # A side is tradeable if it passes the absolute spread test and either the
+    # percentage test or the tight-absolute-spread waiver (cheap OTM contracts
+    # always fail a relative test despite a spread of only a few cents).
+    yes_ok = yes_spread <= max_bid_ask_spread and (
+        yes_pct <= max_bid_ask_pct_spread or yes_spread <= cfg.SPREAD_PCT_EXEMPT_ABS
+    )
+    no_ok = no_spread <= max_bid_ask_spread and (
+        no_pct <= max_bid_ask_pct_spread or no_spread <= cfg.SPREAD_PCT_EXEMPT_ABS
+    )
     if not yes_ok and not no_ok:
         log.debug(
             "Skipping %s: spreads too wide (yes=%.3f/%.0f%%, no=%.3f/%.0f%%)",
