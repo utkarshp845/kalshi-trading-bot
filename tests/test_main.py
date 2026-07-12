@@ -120,3 +120,61 @@ def test_check_exits_triggers_take_profit_path(monkeypatch):
 
     assert exited == ["KXBTC-26APR4PM-B95000"]
     assert store.attempts[0]["reason"] == "take_profit"
+
+
+class _StoreForBackfill:
+    def __init__(self, tickers):
+        self.tickers = tickers
+        self.outcomes = []
+
+    def get_unlabeled_market_tickers(self, before_iso=None, limit=100):
+        return list(self.tickers)
+
+    def upsert_market_outcome(self, **kwargs):
+        self.outcomes.append(kwargs)
+
+
+class _KalshiForBackfill:
+    def __init__(self, settled):
+        self.settled = settled  # tickers that have a settlement available
+        self.fetches = []
+
+    def get_historical_market(self, ticker):
+        self.fetches.append(ticker)
+        if ticker in self.settled:
+            return {"result": "yes", "close_time": "2026-07-12T00:00:00Z", "settlement_ts": "2026-07-12T00:05:00Z"}
+        return {"result": "", "settlement_value_dollars": None}
+
+
+class TestBackfillThrottle:
+    def setup_method(self):
+        main_mod._outcome_backfill_next_attempt.clear()
+
+    def test_unsettled_tickers_not_refetched_until_retry_window(self):
+        store = _StoreForBackfill(["T-UNSETTLED"])
+        kalshi = _KalshiForBackfill(settled=set())
+
+        main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:00:00+00:00")
+        main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:01:00+00:00")
+
+        assert kalshi.fetches == ["T-UNSETTLED"]  # second cycle skips it
+        assert store.outcomes == []
+
+    def test_settled_ticker_upserted_and_throttle_entry_cleared(self):
+        store = _StoreForBackfill(["T-SETTLED"])
+        kalshi = _KalshiForBackfill(settled={"T-SETTLED"})
+
+        main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:00:00+00:00")
+
+        assert len(store.outcomes) == 1
+        assert store.outcomes[0]["result"] == "yes"
+        assert "T-SETTLED" not in main_mod._outcome_backfill_next_attempt
+
+    def test_per_cycle_fetch_cap(self, monkeypatch):
+        monkeypatch.setattr(cfg, "OUTCOME_BACKFILL_MAX_PER_CYCLE", 3)
+        store = _StoreForBackfill([f"T-{i}" for i in range(10)])
+        kalshi = _KalshiForBackfill(settled=set())
+
+        main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:00:00+00:00")
+
+        assert len(kalshi.fetches) == 3
