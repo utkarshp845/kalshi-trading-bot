@@ -178,3 +178,12 @@ class TestBackfillThrottle:
         main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:00:00+00:00")
 
         assert len(kalshi.fetches) == 3
+
+    def test_time_budget_stops_fetching(self, monkeypatch):
+        monkeypatch.setattr(cfg, "OUTCOME_BACKFILL_TIME_BUDGET_SEC", -1.0)  # budget already exhausted
+        store = _StoreForBackfill(["T-1", "T-2"])
+        kalshi = _KalshiForBackfill(settled=set())
+
+        main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:00:00+00:00")
+
+        assert kalshi.fetches == []
