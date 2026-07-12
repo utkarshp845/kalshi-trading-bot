@@ -222,8 +222,14 @@ def run(dry_run: bool) -> None:
                 _stop_event.wait(timeout=cfg.POLL_INTERVAL_SECONDS)
                 continue
 
+            cycle_started = time.monotonic()
             _run_cycle(kalshi, risk, store, dry_run)
-            _stop_event.wait(timeout=cfg.POLL_INTERVAL_SECONDS)
+            cycle_elapsed = time.monotonic() - cycle_started
+            # Fixed cadence: sleep only the remainder of the poll interval so a
+            # slow cycle doesn't stretch the effective period to work + interval.
+            sleep_for = max(5.0, cfg.POLL_INTERVAL_SECONDS - cycle_elapsed)
+            log.info("Cycle took %.1fs — next in %.1fs", cycle_elapsed, sleep_for)
+            _stop_event.wait(timeout=sleep_for)
 
     except KeyboardInterrupt:
         _stop_event.set()
@@ -269,9 +275,20 @@ def _check_fills(kalshi: KalshiClient, store: Store) -> None:
             log.warning("Could not check fill for %s: %s", order_id[:8], e)
 
 
+# Tickers whose settlement wasn't available yet, mapped to the monotonic time
+# of the next allowed attempt. Markets settle minutes after close, so hammering
+# the API for every unlabeled ticker each cycle wastes most of the cycle budget.
+_outcome_backfill_next_attempt: dict[str, float] = {}
+
+
 def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: str) -> None:
-    tickers = store.get_unlabeled_market_tickers(before_iso=before_iso, limit=100)
+    candidates = store.get_unlabeled_market_tickers(before_iso=before_iso, limit=100)
+    now = time.monotonic()
+    tickers = [
+        t for t in candidates if _outcome_backfill_next_attempt.get(t, 0.0) <= now
+    ][: cfg.OUTCOME_BACKFILL_MAX_PER_CYCLE]
     for ticker in tickers:
+        _outcome_backfill_next_attempt[ticker] = now + cfg.OUTCOME_BACKFILL_RETRY_SEC
         try:
             market = kalshi.get_historical_market(ticker)
         except Exception:
@@ -298,6 +315,7 @@ def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: st
             close_time=str(market.get("close_time") or ""),
             settlement_ts=str(market.get("settlement_ts") or market.get("expiration_time") or ""),
         )
+        _outcome_backfill_next_attempt.pop(ticker, None)
 
 
 def _execute_passive_exit(
@@ -823,6 +841,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     cycle_id = datetime.now(timezone.utc).isoformat()
     log.info("--- Cycle start ---")
     orders_placed = 0
+    _t0 = time.monotonic()
 
     enabled = _enabled_underlyings()
     if not enabled:
@@ -841,6 +860,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     # --- Set session balance for drawdown tracking ---
     risk.set_session_balance(balance)
     open_positions_by_symbol = _positions_by_symbol(positions)
+    _t_account = time.monotonic()
 
     assets, features_by_symbol, total_markets = _build_cycle_assets(kalshi, store, open_positions_by_symbol)
     for asset in assets.values():
@@ -848,6 +868,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
     for features in features_by_symbol.values():
         for feature in features:
             store.log_market_snapshot(cycle_id, feature)
+    _t_build = time.monotonic()
 
     if not assets:
         _consecutive_price_feed_failures += 1
@@ -897,7 +918,9 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
 
     # --- Fill quality check ---
     _backfill_market_outcomes(kalshi, store, before_iso=cycle_id)
+    _t_backfill = time.monotonic()
     _check_fills(kalshi, store)
+    _t_fills = time.monotonic()
 
     # --- Position exit check (loss + take-profit, routed by underlying) ---
     exited_tickers = _check_exits(kalshi, store, positions, assets, trading_mode, cycle_id=cycle_id)
@@ -914,6 +937,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
 
     held_tickers = {p.ticker for p in positions}
     open_count = len(positions)
+    _t_exits = time.monotonic()
 
     # --- Signal scan across all underlyings ---
     all_decisions = []
@@ -937,6 +961,12 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         [d for d in all_decisions if d.eligible],
         key=lambda d: d.score,
         reverse=True,
+    )
+    _t_scan = time.monotonic()
+    log.info(
+        "Cycle timing: account=%.1fs build=%.1fs backfill=%.1fs fills=%.1fs exits=%.1fs scan=%.1fs",
+        _t_account - _t0, _t_build - _t_account, _t_backfill - _t_build,
+        _t_fills - _t_backfill, _t_exits - _t_fills, _t_scan - _t_exits,
     )
     log.info(
         "Combined signals: %d eligible / %d total across %d underlying(s) (%s)%s",

@@ -157,6 +157,10 @@ ALERT_DEDUP_SECONDS: int = _int("ALERT_DEDUP_SECONDS", 900)
 
 # --- Execution ---
 POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 60)   # was 120 — faster reaction to mispricings
+# Settlement backfill: unlabeled markets are re-checked at most this often, and
+# at most this many API fetches per cycle, so backfill can't eat the cycle budget.
+OUTCOME_BACKFILL_RETRY_SEC: float = _float("OUTCOME_BACKFILL_RETRY_SEC", 900.0)
+OUTCOME_BACKFILL_MAX_PER_CYCLE: int = _int("OUTCOME_BACKFILL_MAX_PER_CYCLE", 25)
 DRY_RUN: bool = _bool("DRY_RUN", False)
 FORCE_TRADING_HOURS: bool = _bool("FORCE_TRADING_HOURS", False)
 
