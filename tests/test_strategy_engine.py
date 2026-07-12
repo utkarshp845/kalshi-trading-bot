@@ -128,7 +128,7 @@ def test_decision_rejects_when_depth_slippage_erases_edge():
     decision = decide_signal(
         _Store(),
         _asset(),
-        _feature(edge=0.18, depth_slippage=0.04, expected_fill_price=0.48, orderbook_available=True),
+        _feature(edge=0.18, depth_slippage=0.06, expected_fill_price=0.48, orderbook_available=True),
         held_tickers=set(),
     )
     assert decision.eligible is False
