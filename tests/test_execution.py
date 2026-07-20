@@ -267,6 +267,90 @@ class TestTakerFallback:
         assert len(kalshi.place_calls) == 1  # only the initial post_only attempt
 
 
+class TestTakerEscalationAfterMakerTimeout:
+    def test_maker_timeout_escalates_to_taker_when_edge_clears(self):
+        unfilled = _order("o1", count=5, fill_count=0, fill_cost=0.0, price=0.40)
+        taker_fill = _order("o2", count=5, fill_count=5, fill_cost=2.25, price=0.45)
+        kalshi = FakeKalshi(
+            place_results=[unfilled, taker_fill],
+            get_results={"o1": unfilled, "o2": taker_fill},
+        )
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,
+        )
+
+        assert len(orders) == 1
+        assert orders[0].order_id == "o2"
+        assert orders[0].fill_count == 5
+        assert kalshi.cancels == ["o1"]
+        # Second placement is a plain taker order at the (re-checked) ask
+        assert "post_only" not in kalshi.place_calls[1][4]
+        assert kalshi.place_calls[1][2] == 5
+        assert kalshi.place_calls[1][3] == pytest.approx(0.45)
+
+    def test_partial_maker_fill_escalates_remainder_and_returns_both(self):
+        partial = _order("o1", count=10, fill_count=3, fill_cost=1.20, price=0.40)
+        taker_fill = _order("o2", count=7, fill_count=7, fill_cost=3.15, price=0.45)
+        kalshi = FakeKalshi(
+            place_results=[partial, taker_fill],
+            get_results={"o1": partial, "o2": taker_fill},
+        )
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,
+        )
+
+        assert [o.order_id for o in orders] == ["o1", "o2"]
+        assert sum(o.fill_count for o in orders) == 10
+        assert kalshi.place_calls[1][2] == 7  # only the unfilled remainder
+
+    def test_no_escalation_when_taker_edge_below_hurdle(self):
+        unfilled = _order("o1", count=5, fill_count=0, fill_cost=0.0, price=0.40)
+        kalshi = FakeKalshi(place_results=[unfilled], get_results={"o1": unfilled})
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.20, required_edge=0.25,
+        )
+
+        assert orders == []
+        assert len(kalshi.place_calls) == 1
+
+    def test_no_escalation_when_ask_worsened(self):
+        """FakeKalshi's live ask is 0.45; edge was computed at 0.40 — don't chase."""
+        unfilled = _order("o1", count=5, fill_count=0, fill_cost=0.0, price=0.38)
+        kalshi = FakeKalshi(place_results=[unfilled], get_results={"o1": unfilled})
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.40, mid_price=0.39, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,
+        )
+
+        assert orders == []
+        assert len(kalshi.place_calls) == 1
+
+    def test_no_escalation_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(cfg, "ENABLE_TAKER_ESCALATION", False)
+        unfilled = _order("o1", count=5, fill_count=0, fill_cost=0.0, price=0.40)
+        kalshi = FakeKalshi(place_results=[unfilled], get_results={"o1": unfilled})
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,
+        )
+
+        assert orders == []
+        assert len(kalshi.place_calls) == 1
+
+
 class TestSigtermDuringMakerWait:
     def test_stop_event_cancels_resting_order_and_returns_partial(self, monkeypatch):
         monkeypatch.setattr(cfg, "MAKER_ENTRY_TIMEOUT_SEC", 60)

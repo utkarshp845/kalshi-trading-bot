@@ -108,7 +108,7 @@ Copy `.env.example` to `.env` and fill in credentials. **Every value in `config.
 |---|---|---|
 | `TRADING_MODE` | `observe` | `observe`, `paper`, or `live` |
 | `ENABLE_BTC` / `ENABLE_ETH` | `true` | Enable each underlying independently |
-| `MIN_EDGE` | `0.04` | Hard minimum net edge floor |
+| `MIN_EDGE` | `0.025` | Hard minimum net edge floor |
 | `KALSHI_TAKER_FEE` / `KALSHI_MAKER_FEE` | `0.07` / `0.0175` | Fee coefficients: `fee = rate × contracts × price × (1 - price)` |
 | `POLL_INTERVAL_SECONDS` | `60` | Target cycle cadence (the loop sleeps only the remainder after cycle work) |
 
@@ -123,8 +123,9 @@ Copy `.env.example` to `.env` and fill in credentials. **Every value in `config.
 | `MAX_SIGMA_DISTANCE` | `3.0` | Reject strikes too far from spot in modeled sigma units |
 | `MAX_CHAIN_BREAK_PCT` | `0.10` | Reject assets with too many strike-chain inconsistencies |
 | `MAX_DEPTH_SLIPPAGE_PER_CONTRACT` | `0.05` | Reject when orderbook-implied slippage per contract exceeds this |
-| `EDGE_LEAK_LOOKBACK_FILLS` / `EDGE_HURDLE_BUFFER` | `50` / `0.015` | Dynamic edge hurdle from recent realized fill quality |
-| `LIVE_MIN_REQUIRED_EDGE` / `COLD_START_MIN_EDGE` | `0.04` / `0.04` | Minimum required edge in live mode, before/after enough fill history exists |
+| `EDGE_LEAK_LOOKBACK_FILLS` / `EDGE_HURDLE_BUFFER` | `50` / `0.010` | Dynamic edge hurdle from recent realized fill quality |
+| `LIVE_MIN_REQUIRED_EDGE` / `COLD_START_MIN_EDGE` | `0.025` / `0.025` | Minimum required edge in live mode, before/after enough fill history exists |
+| `ENABLE_TAKER_ESCALATION` | `true` | If a maker bid times out unfilled and the taker-priced edge still clears the hurdle, cross the spread for the remainder instead of cancelling |
 | `LIVE_HALT_MAX_AVG_REALIZED_EDGE` | `0.0` | Halt live trading if recent average realized edge falls to/below this |
 
 ### Data Freshness

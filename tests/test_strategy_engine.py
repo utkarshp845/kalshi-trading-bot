@@ -136,11 +136,12 @@ def test_decision_rejects_when_depth_slippage_erases_edge():
 
 
 def test_live_mode_requires_higher_cold_start_edge():
-    # In cold start (0 fills), required_edge interpolates up to COLD_START_MIN_EDGE (0.04)
-    decision = decide_signal(_Store(), _asset(), _feature(edge=0.02), held_tickers=set(), trading_mode="live")
+    # In cold start (0 fills), required_edge interpolates up to COLD_START_MIN_EDGE
+    import bot.config as cfg
+    decision = decide_signal(_Store(), _asset(), _feature(edge=0.01), held_tickers=set(), trading_mode="live")
     assert decision.eligible is False
     assert decision.reject_reason == "edge_below_hurdle"
-    assert decision.required_edge >= 0.04
+    assert decision.required_edge >= cfg.COLD_START_MIN_EDGE
 
 
 def test_live_mode_rejects_negative_recent_realized_edge():

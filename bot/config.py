@@ -6,32 +6,66 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Keys that came from the environment (.env or exported) instead of code
+# defaults. The server's .env silently pins old values across deploys; logging
+# this at startup makes that drift visible. Secret values are masked.
+_ENV_OVERRIDES: dict[str, str] = {}
+_SECRET_KEYS = {"KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "ALERT_WEBHOOK_URL"}
+
+
+def _track_override(key: str, val: str) -> None:
+    _ENV_OVERRIDES[key] = "<set>" if key in _SECRET_KEYS else val
+
+
+def env_overrides() -> dict[str, str]:
+    """Config keys whose values came from the environment rather than defaults."""
+    return dict(_ENV_OVERRIDES)
+
+
 def _require(key: str) -> str:
     """Return env var value; returns empty string at import time if not set (validated at runtime)."""
-    return os.getenv(key, "")
+    val = os.getenv(key)
+    if val is not None:
+        _track_override(key, val)
+    return val or ""
+
+
+def _str(key: str, default: str) -> str:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    _track_override(key, val)
+    return val
 
 
 def _float(key: str, default: float) -> float:
     val = os.getenv(key)
-    return float(val) if val is not None else default
+    if val is None:
+        return default
+    _track_override(key, val)
+    return float(val)
 
 
 def _int(key: str, default: int) -> int:
     val = os.getenv(key)
-    return int(val) if val is not None else default
+    if val is None:
+        return default
+    _track_override(key, val)
+    return int(val)
 
 
 def _bool(key: str, default: bool) -> bool:
     val = os.getenv(key)
     if val is None:
         return default
+    _track_override(key, val)
     return val.strip().lower() in ("1", "true", "yes")
 
 
 # --- Kalshi API ---
 KALSHI_API_KEY_ID: str = _require("KALSHI_API_KEY_ID")
 KALSHI_PRIVATE_KEY_PATH: Path = Path(_require("KALSHI_PRIVATE_KEY_PATH"))
-KALSHI_BASE_URL: str = os.getenv(
+KALSHI_BASE_URL: str = _str(
     "KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"
 )
 KALSHI_TAKER_FEE: float = _float("KALSHI_TAKER_FEE", 0.07)  # taker fee coefficient: fee = 0.07 * contracts * price * (1-price)
@@ -44,8 +78,8 @@ ENABLE_BTC: bool = _bool("ENABLE_BTC", True)
 ENABLE_ETH: bool = _bool("ENABLE_ETH", True)
 
 # --- Strategy ---
-MIN_EDGE: float = _float("MIN_EDGE", 0.04)          # was 0.05 — widen opportunity set; aggressive-risk mode
-TRADING_MODE: str = os.getenv("TRADING_MODE", "observe").strip().lower()
+MIN_EDGE: float = _float("MIN_EDGE", 0.025)          # was 0.04 — zero trades at 0.04; trade marginal edges for feedback
+TRADING_MODE: str = _str("TRADING_MODE", "observe").strip().lower()
 USE_DRIFT: bool = _bool("USE_DRIFT", False)         # 30-day trailing drift is too noisy to be reliable signal; disabled by default
 DRIFT_LOOKBACK_DAYS: int = _int("DRIFT_LOOKBACK_DAYS", 30)  # window for the trailing log-return drift estimate
 MIN_T_HOURS: float = _float("MIN_T_HOURS", 0.25)    # was 0.5 — hourly markets spend most of their life under 1h; only skip the final 15min
@@ -69,18 +103,18 @@ MAX_SIGMA_DISTANCE: float = _float("MAX_SIGMA_DISTANCE", 3.0)  # was 2.0 — sca
 MAX_CHAIN_BREAK_PCT: float = _float("MAX_CHAIN_BREAK_PCT", 0.10)
 IMBALANCE_SCORE_WEIGHT: float = _float("IMBALANCE_SCORE_WEIGHT", 0.03)  # orderbook imbalance contribution to signal score; max ±0.03
 EDGE_LEAK_LOOKBACK_FILLS: int = _int("EDGE_LEAK_LOOKBACK_FILLS", 50)
-EDGE_HURDLE_BUFFER: float = _float("EDGE_HURDLE_BUFFER", 0.015)  # was 0.02 — slightly less conservative once fill history exists
+EDGE_HURDLE_BUFFER: float = _float("EDGE_HURDLE_BUFFER", 0.010)  # was 0.015 — slightly less conservative once fill history exists
 SETTLED_MAE_LOOKBACK_TRADES: int = _int("SETTLED_MAE_LOOKBACK_TRADES", 30)
-DEFAULT_EXPECTED_SLIPPAGE: float = _float("DEFAULT_EXPECTED_SLIPPAGE", 0.015)  # was 0.03 — maker-first means real slippage is lower
-DEFAULT_UNCERTAINTY_PENALTY: float = _float("DEFAULT_UNCERTAINTY_PENALTY", 0.015)  # was 0.02 — less punishing before any fill history
+DEFAULT_EXPECTED_SLIPPAGE: float = _float("DEFAULT_EXPECTED_SLIPPAGE", 0.010)  # was 0.015 — maker-first means real slippage is lower
+DEFAULT_UNCERTAINTY_PENALTY: float = _float("DEFAULT_UNCERTAINTY_PENALTY", 0.010)  # was 0.015 — the score gate stacks this on top of the edge hurdle; keep the double-count small
 MAX_DEPTH_SLIPPAGE_PER_CONTRACT: float = _float("MAX_DEPTH_SLIPPAGE_PER_CONTRACT", 0.05)  # was 0.035 — OTM strikes have thin books; slippage is priced into the score anyway
 LIQUIDITY_ENTRY_MULTIPLIER: float = _float("LIQUIDITY_ENTRY_MULTIPLIER", 5.0)
 ORDERBOOK_DEPTH: int = _int("ORDERBOOK_DEPTH", 20)
 DATA_STALE_AFTER_SEC_KRAKEN: int = _int("DATA_STALE_AFTER_SEC_KRAKEN", 20)
 DATA_STALE_AFTER_SEC_KALSHI: int = _int("DATA_STALE_AFTER_SEC_KALSHI", 20)
 DATA_STALE_AFTER_SEC_DERIBIT: int = _int("DATA_STALE_AFTER_SEC_DERIBIT", 120)
-LIVE_MIN_REQUIRED_EDGE: float = _float("LIVE_MIN_REQUIRED_EDGE", 0.04)  # was 0.06 — aggressive mode, trade more marginal edges
-COLD_START_MIN_EDGE: float = _float("COLD_START_MIN_EDGE", 0.04)  # was 0.06 — match LIVE_MIN_REQUIRED_EDGE so cold start isn't a separate hurdle
+LIVE_MIN_REQUIRED_EDGE: float = _float("LIVE_MIN_REQUIRED_EDGE", 0.025)  # was 0.04 — zero trades at 0.04; match MIN_EDGE
+COLD_START_MIN_EDGE: float = _float("COLD_START_MIN_EDGE", 0.025)  # match LIVE_MIN_REQUIRED_EDGE so cold start isn't a separate hurdle
 LIVE_MIN_FILL_HISTORY: int = _int("LIVE_MIN_FILL_HISTORY", 8)
 LIVE_MIN_SETTLED_HISTORY: int = _int("LIVE_MIN_SETTLED_HISTORY", 10)
 LIVE_GUARD_LOOKBACK_FILLS: int = _int("LIVE_GUARD_LOOKBACK_FILLS", 20)
@@ -130,6 +164,10 @@ TAKE_PROFIT_MIN_HOURS: float = _float("TAKE_PROFIT_MIN_HOURS", 0.5)  # only take
 
 # --- Smart Order Placement ---
 ENABLE_MAKER_ORDERS: bool = _bool("ENABLE_MAKER_ORDERS", True)          # post at bid first (maker, $0 fee) before trying mid/ask
+# When the maker bid times out unfilled, cross the spread for the remainder if
+# the taker-priced edge still clears the hurdle. Without this, thin OTM books
+# turn nearly every eligible signal into a cancelled order (execution_no_fill).
+ENABLE_TAKER_ESCALATION: bool = _bool("ENABLE_TAKER_ESCALATION", True)
 MAKER_ORDER_TIMEOUT_SEC: int = _int("MAKER_ORDER_TIMEOUT_SEC", 120)     # seconds to wait for a maker-bid fill
 ENABLE_PRICE_IMPROVEMENT: bool = _bool("ENABLE_PRICE_IMPROVEMENT", True)
 PRICE_IMPROVEMENT_TIMEOUT_SEC: int = _int("PRICE_IMPROVEMENT_TIMEOUT_SEC", 90)  # was 45 — more time at mid before falling back
@@ -151,8 +189,8 @@ DRAWDOWN_TIER_2_PCT: float = _float("DRAWDOWN_TIER_2_PCT", 0.15)    # 15% drawdo
 DRAWDOWN_TIER_2_SCALE: float = _float("DRAWDOWN_TIER_2_SCALE", 0.25)  # scale sizing to 25%
 
 # --- Monitoring ---
-ALERT_WEBHOOK_URL: str = os.getenv("ALERT_WEBHOOK_URL", "")  # Slack/Discord webhook; empty = log only
-ALERT_WEBHOOK_MIN_LEVEL: str = os.getenv("ALERT_WEBHOOK_MIN_LEVEL", "WARNING").upper()
+ALERT_WEBHOOK_URL: str = _str("ALERT_WEBHOOK_URL", "")  # Slack/Discord webhook; empty = log only
+ALERT_WEBHOOK_MIN_LEVEL: str = _str("ALERT_WEBHOOK_MIN_LEVEL", "WARNING").upper()
 ALERT_DEDUP_SECONDS: int = _int("ALERT_DEDUP_SECONDS", 900)
 
 # --- Execution ---
