@@ -162,6 +162,17 @@ def run(dry_run: bool) -> None:
         cfg.ENABLE_PRICE_IMPROVEMENT, cfg.PRICE_IMPROVEMENT_TIMEOUT_SEC,
         cfg.POLL_INTERVAL_SECONDS,
     )
+    # Make .env drift visible: any key listed here is pinned by the environment
+    # and will NOT pick up new config.py defaults on deploy.
+    overrides = cfg.env_overrides()
+    if overrides:
+        log.warning(
+            "Env overrides active (%d) — these ignore config.py defaults: %s",
+            len(overrides),
+            "  ".join(f"{k}={v}" for k, v in sorted(overrides.items())),
+        )
+    else:
+        log.info("No env overrides — all config values are code defaults")
 
     if not cfg.KALSHI_API_KEY_ID:
         log.error("KALSHI_API_KEY_ID is not set. Copy .env.example to .env and fill in your credentials.")
@@ -728,11 +739,48 @@ def _execute_with_price_improvement(
         log.warning("Could not cancel maker order %s during cleanup: %s", order1.order_id[:8], e)
     if _stop_event.is_set():
         log.info("Maker-first entry for %s interrupted by shutdown — cancelled resting order", ticker)
-    elif spot_moved or book_deteriorated:
+        return [order1] if filled > 0 else []
+    if spot_moved or book_deteriorated:
         log.info(
             "Maker-first entry canceled for %s: spot_moved=%s book_deteriorated=%s",
             ticker, spot_moved, book_deteriorated,
         )
+
+    # Taker escalation: the signal already cleared the hurdle at taker prices,
+    # so a timed-out maker bid should convert to a taker fill, not a cancel.
+    # Skipped when spot moved (the quote is stale) or the ask worsened past the
+    # price the edge was computed at.
+    remaining = contracts - filled
+    if (
+        cfg.ENABLE_TAKER_ESCALATION
+        and remaining > 0
+        and not spot_moved
+        and taker_edge is not None
+        and required_edge is not None
+        and taker_edge >= required_edge
+    ):
+        current_ask = ask_price
+        try:
+            market = kalshi.get_market(ticker)
+            current_ask = market.yes_ask if side == "yes" else market.no_ask
+        except Exception:
+            pass
+        if 0.0 < current_ask <= ask_price + 1e-9:
+            try:
+                taker = kalshi.place_order(ticker, side, remaining, current_ask)
+                log.info(
+                    "Taker escalation: maker unfilled after %ds, taker edge %.4f clears %.4f — %s x%d @ %.3f → id=%s status=%s",
+                    elapsed, taker_edge, required_edge, ticker, remaining,
+                    current_ask, taker.order_id[:8], taker.status,
+                )
+                return [order1, taker] if filled > 0 else [taker]
+            except Exception as e:
+                log.warning("Taker escalation failed for %s: %s", ticker, e)
+        else:
+            log.info(
+                "Taker escalation skipped for %s: ask moved %.3f → %.3f",
+                ticker, ask_price, current_ask,
+            )
     return [order1] if filled > 0 else []
 
 
@@ -990,16 +1038,20 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         f" rejects={dict(reject_counts)}" if reject_counts else "",
     )
     if len(eligible_decisions) == 0 and all_decisions:
-        # Log the closest-to-eligible rejects to aid debugging
+        # Zero-signal cycle: show the highest-edge candidates the funnel killed
+        # and exactly how far each fell short, so a dry spell is diagnosable
+        # from the log without querying the DB.
         near_misses = sorted(
-            [d for d in all_decisions if d.reject_reason in ("prob_band", "last_price_diverge", "edge_below_hurdle", "sigma_distance", "score_non_positive")],
-            key=lambda d: abs(d.theo_prob - 0.50),
+            [d for d in all_decisions if d.reject_reason != "already_held"],
+            key=lambda d: d.edge,
+            reverse=True,
         )[:3]
         for nm in near_misses:
             log.info(
-                "Near-miss %s %s: theo=%.3f T=%.1fh edge=%.4f req=%.4f reject=%s",
-                nm.ticker, nm.side, nm.theo_prob, nm.hours_to_expiry,
-                nm.edge, nm.required_edge, nm.reject_reason,
+                "Best reject %s %s: edge=%.4f vs req=%.4f (short %+.4f)  score=%.4f  "
+                "theo=%.3f bid=%.2f ask=%.2f T=%.1fh — %s",
+                nm.ticker, nm.side, nm.edge, nm.required_edge, nm.edge - nm.required_edge,
+                nm.score, nm.theo_prob, nm.bid, nm.ask, nm.hours_to_expiry, nm.reject_reason,
             )
 
     # --- Order placement ---
@@ -1151,6 +1203,14 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
                 open_positions_by_symbol[decision.symbol] = open_positions_by_symbol.get(decision.symbol, 0) + 1
                 open_count += 1
                 orders_placed += 1
+                # WARNING so it clears the default webhook threshold — a fill is
+                # exactly the event the user wants pushed, not buried in the log.
+                alert(
+                    f"ENTRY fill: {decision.ticker} {decision.side} x{total_filled} "
+                    f"~${fill_cost:.2f} (theo {decision.theo_prob:.2f}, edge {decision.edge:.3f}, "
+                    f"balance ${balance:,.2f})",
+                    level="WARNING",
+                )
             time.sleep(0.5)  # avoid burst rate-limiting between orders
         except Exception as e:
             store.log_execution_attempt(
