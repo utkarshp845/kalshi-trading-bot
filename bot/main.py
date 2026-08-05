@@ -614,6 +614,24 @@ def _build_cycle_assets(
     return assets, features_by_symbol, total_markets
 
 
+def _http_error_detail(e: Exception) -> str:
+    """Best-effort extraction of Kalshi's JSON error body from an HTTPError.
+
+    A bare status line (e.g. "410 Client Error: Gone for url: ...") gives no
+    indication of *why* an order was rejected — Kalshi's error responses
+    carry a body with the actual reason. Falls back to str(e) for anything
+    that isn't an HTTPError with a readable body.
+    """
+    resp = getattr(e, "response", None)
+    if resp is None:
+        return str(e)
+    try:
+        return f"{e} — body={resp.json()}"
+    except Exception:
+        text = (getattr(resp, "text", "") or "")[:500]
+        return f"{e} — body={text}" if text else str(e)
+
+
 def _execute_with_price_improvement(
     kalshi: KalshiClient,
     ticker: str,
@@ -660,19 +678,19 @@ def _execute_with_price_improvement(
         if e.response is not None and 400 <= e.response.status_code < 500:
             if taker_edge is None or required_edge is None:
                 log.info(
-                    "Post-only rejected for %s (HTTP %d) — no taker edge check supplied; skipping fallback",
-                    ticker, e.response.status_code,
+                    "Post-only rejected for %s (HTTP %d) — no taker edge check supplied; skipping fallback — %s",
+                    ticker, e.response.status_code, _http_error_detail(e),
                 )
                 return []
             if taker_edge < required_edge:
                 log.info(
-                    "Post-only rejected for %s (HTTP %d) — taker edge %.4f below required %.4f; skipping fallback",
-                    ticker, e.response.status_code, taker_edge, required_edge,
+                    "Post-only rejected for %s (HTTP %d) — taker edge %.4f below required %.4f; skipping fallback — %s",
+                    ticker, e.response.status_code, taker_edge, required_edge, _http_error_detail(e),
                 )
                 return []
             log.info(
-                "Post-only rejected for %s (HTTP %d) — taker edge %.4f clears %.4f; falling back @ %.3f",
-                ticker, e.response.status_code, taker_edge, required_edge, ask_price,
+                "Post-only rejected for %s (HTTP %d) — taker edge %.4f clears %.4f; falling back @ %.3f — %s",
+                ticker, e.response.status_code, taker_edge, required_edge, ask_price, _http_error_detail(e),
             )
             try:
                 taker = kalshi.place_order(ticker, side, contracts, ask_price)
@@ -680,12 +698,12 @@ def _execute_with_price_improvement(
                          ticker, contracts, ask_price, taker.order_id[:8], taker.status)
                 return [taker]
             except Exception as e2:
-                log.warning("Taker fallback also failed for %s: %s", ticker, e2)
+                log.warning("Taker fallback also failed for %s: %s", ticker, _http_error_detail(e2))
                 return []
-        log.warning("Maker-first order failed for %s: %s", ticker, e)
+        log.warning("Maker-first order failed for %s: %s", ticker, _http_error_detail(e))
         return []
     except Exception as e:
-        log.warning("Maker-first order failed for %s: %s", ticker, e)
+        log.warning("Maker-first order failed for %s: %s", ticker, _http_error_detail(e))
         return []
 
     total_wait = max(0, cfg.MAKER_ENTRY_TIMEOUT_SEC)
@@ -775,7 +793,7 @@ def _execute_with_price_improvement(
                 )
                 return [order1, taker] if filled > 0 else [taker]
             except Exception as e:
-                log.warning("Taker escalation failed for %s: %s", ticker, e)
+                log.warning("Taker escalation failed for %s: %s", ticker, _http_error_detail(e))
         else:
             log.info(
                 "Taker escalation skipped for %s: ask moved %.3f → %.3f",

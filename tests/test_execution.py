@@ -407,3 +407,31 @@ class TestSigtermDuringMakerWait:
 
         assert orders == []
         assert kalshi.cancels == ["o1"]
+
+
+class TestHttpErrorDetail:
+    def test_extracts_json_body_from_http_error(self):
+        resp = MagicMock()
+        resp.json.return_value = {"error": {"code": "market_not_open", "message": "gone"}}
+        error = requests.exceptions.HTTPError("410 Client Error: Gone for url: ...")
+        error.response = resp
+
+        detail = main_mod._http_error_detail(error)
+
+        assert "market_not_open" in detail
+
+    def test_falls_back_to_response_text_when_body_not_json(self):
+        resp = MagicMock()
+        resp.json.side_effect = ValueError("not json")
+        resp.text = "plain text error"
+        error = requests.exceptions.HTTPError("500 Server Error")
+        error.response = resp
+
+        detail = main_mod._http_error_detail(error)
+
+        assert "plain text error" in detail
+
+    def test_falls_back_to_str_when_no_response(self):
+        error = ValueError("boom")
+
+        assert main_mod._http_error_detail(error) == "boom"
