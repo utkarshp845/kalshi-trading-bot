@@ -395,6 +395,83 @@ class KalshiClient:
     # Orders
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _book_side_and_price(side: str, action: str, price_dollars: float) -> tuple[str, float]:
+        """
+        Map this client's (side: "yes"/"no", action: "buy"/"sell") vocabulary
+        onto Kalshi's V2 order API, which has no separate NO leg — it quotes
+        everything from the YES side as a single book: `bid` buys YES, `ask`
+        sells YES (equivalently: buys NO at `1 - price`).
+
+        Truth table (from Kalshi's Order schema docs — outcome_side/book_side):
+            buy  yes -> outcome_side yes -> book_side bid, price = yes price
+            sell no  -> outcome_side yes -> book_side bid, price = 1 - no_price
+            buy  no  -> outcome_side no  -> book_side ask, price = 1 - no_price
+            sell yes -> outcome_side no  -> book_side ask, price = yes price
+
+        `price_dollars` is always in this client's existing vocabulary: the
+        price of the *side* being traded (a YES price when side=="yes", a NO
+        price when side=="no"). It's converted to the YES-side price V2
+        requires since no_price and yes_price are complements in a binary
+        market (no_price = 1 - yes_price).
+        """
+        is_yes = side == "yes"
+        is_buy = action == "buy"
+        book_side = "bid" if is_yes == is_buy else "ask"
+        yes_price = price_dollars if is_yes else (1.0 - price_dollars)
+        return book_side, yes_price
+
+    def _create_order_v2(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price_dollars: float,
+        client_order_id: Optional[str] = None,
+        post_only: bool = False,
+        time_in_force: Optional[str] = None,
+    ) -> Order:
+        """
+        Submit an order via Kalshi's V2 order-creation endpoint (the legacy
+        POST /portfolio/orders is deprecated and now returns HTTP 410).
+
+        The V2 create response carries no `status` field (just order_id,
+        fill_count, remaining_count, ...), so this immediately follows up
+        with GET /portfolio/orders/{id} — that endpoint is unaffected by the
+        V2 migration and still returns the same shape (status,
+        yes_price_dollars, fill_count_fp, ...) every existing caller already
+        depends on. This keeps the migration's blast radius limited to order
+        creation; nothing downstream of place_order/sell_position needs to
+        change. Known edge case: if the order is created but this follow-up
+        GET fails after its own retries, the caller sees a failure even
+        though an order may now be resting on Kalshi's book — same ambiguity
+        any at-most-once order API has on a dropped response.
+        """
+        book_side, yes_price = self._book_side_and_price(side, action, price_dollars)
+        yes_price = round(max(0.01, min(0.99, yes_price)), 2)
+        tif = time_in_force or "good_till_canceled"
+
+        body: dict[str, Any] = {
+            "ticker": ticker,
+            "side": book_side,
+            "count": f"{count:.2f}",
+            "price": f"{yes_price:.2f}",
+            "time_in_force": tif,
+            "self_trade_prevention_type": "taker_at_cross",
+        }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        if post_only:
+            body["post_only"] = True
+
+        path = "/portfolio/events/orders"
+        data = self._post(path, body)
+        order_id = data.get("order_id") or (data.get("order") or {}).get("order_id")
+        if not order_id:
+            raise ValueError(f"CreateOrderV2 response missing order_id: {data}")
+        return self.get_order(order_id)
+
     def place_order(
         self,
         ticker: str,
@@ -416,30 +493,10 @@ class KalshiClient:
             price_dollars:   Limit price in dollars (0.01 – 0.99)
             client_order_id: Optional idempotency key
         """
-        body: dict[str, Any] = {
-            "ticker": ticker,
-            "side": side,
-            "action": "buy",
-            "type": "limit",
-            "count": count,
-        }
-        # Send price as cents integer (Kalshi accepts 1–99)
-        price_cents = max(1, min(99, round(price_dollars * 100)))
-        if side == "yes":
-            body["yes_price"] = price_cents
-        else:
-            body["no_price"] = price_cents
-
-        if client_order_id:
-            body["client_order_id"] = client_order_id
-        if post_only:
-            body["post_only"] = True
-        if time_in_force:
-            body["time_in_force"] = time_in_force
-
-        path = "/portfolio/orders"
-        data = self._post(path, body)
-        order = Order.from_dict(data.get("order", data))
+        order = self._create_order_v2(
+            ticker, side, "buy", count, price_dollars,
+            client_order_id=client_order_id, post_only=post_only, time_in_force=time_in_force,
+        )
         log.info(
             "Order placed: %s %s %s x%d @ $%.2f post_only=%s tif=%s → id=%s status=%s",
             ticker, side, "buy", count, price_dollars, post_only, time_in_force,
@@ -468,22 +525,7 @@ class KalshiClient:
             count:         Number of contracts to sell
             price_dollars: Limit price (at or above current bid for immediate fill)
         """
-        body: dict[str, Any] = {
-            "ticker": ticker,
-            "side": side,
-            "action": "sell",
-            "type": "limit",
-            "count": count,
-        }
-        price_cents = max(1, min(99, round(price_dollars * 100)))
-        if side == "yes":
-            body["yes_price"] = price_cents
-        else:
-            body["no_price"] = price_cents
-
-        path = "/portfolio/orders"
-        data = self._post(path, body)
-        order = Order.from_dict(data.get("order", data))
+        order = self._create_order_v2(ticker, side, "sell", count, price_dollars)
         log.info(
             "Exit order placed: %s %s sell x%d @ $%.2f → id=%s status=%s",
             ticker, side, count, price_dollars, order.order_id, order.status,
@@ -493,7 +535,7 @@ class KalshiClient:
     def cancel_order(self, order_id: str) -> None:
         """Cancel an open order. Silently ignores 404 (already filled/cancelled)."""
         try:
-            self._delete(f"/portfolio/orders/{order_id}")
+            self._delete(f"/portfolio/events/orders/{order_id}")
             log.info("Order cancelled: %s", order_id)
         except Exception as e:
             log.warning("Cancel failed for %s: %s", order_id[:8], e)
