@@ -23,6 +23,29 @@ from cryptography.hazmat.primitives.asymmetric import padding
 log = logging.getLogger(__name__)
 
 
+class OrderVerificationError(Exception):
+    """
+    An order was successfully created (the V2 create POST succeeded and
+    returned an order_id) but its status could not be confirmed afterward —
+    GET /portfolio/orders/{id} kept 404ing even after retries, most likely a
+    read-after-write propagation delay on Kalshi's side rather than the
+    order not existing.
+
+    This is deliberately NOT a subclass of requests.exceptions.HTTPError:
+    callers must be able to tell "the order was never created, safe to try
+    something else" apart from "the order almost certainly exists, do NOT
+    place another one for the same signal." Treating this the same as an
+    outright creation failure is what caused a real incident — a maker
+    order that filled but couldn't be verified was followed by a taker
+    fallback for the same signal, doubling the position.
+    """
+
+    def __init__(self, order_id: str, ticker: str, message: str):
+        self.order_id = order_id
+        self.ticker = ticker
+        super().__init__(message)
+
+
 def _money_from_dict(d: dict, dollars_key: str, cents_key: str) -> float:
     """
     Read a money field from Kalshi JSON.
@@ -443,10 +466,17 @@ class KalshiClient:
         yes_price_dollars, fill_count_fp, ...) every existing caller already
         depends on. This keeps the migration's blast radius limited to order
         creation; nothing downstream of place_order/sell_position needs to
-        change. Known edge case: if the order is created but this follow-up
-        GET fails after its own retries, the caller sees a failure even
-        though an order may now be resting on Kalshi's book — same ambiguity
-        any at-most-once order API has on a dropped response.
+        change.
+
+        Confirmed in production (2026-08-05): immediately after a real V2
+        create, this GET can 404 for several seconds — a read-after-write
+        propagation delay, not the order actually being missing. The order
+        itself was already live and filling. Retries below absorb that. If
+        it's still unconfirmed after retries, raises OrderVerificationError
+        rather than a generic error — see that class's docstring for why
+        callers must not treat this the same as an outright creation
+        failure and must not retry/fallback into placing a second order for
+        the same signal.
         """
         book_side, yes_price = self._book_side_and_price(side, action, price_dollars)
         yes_price = round(max(0.01, min(0.99, yes_price)), 2)
@@ -470,7 +500,28 @@ class KalshiClient:
         order_id = data.get("order_id") or (data.get("order") or {}).get("order_id")
         if not order_id:
             raise ValueError(f"CreateOrderV2 response missing order_id: {data}")
-        return self.get_order(order_id)
+
+        # The order now exists on Kalshi's book — a 404 here means GET
+        # hasn't caught up yet, not that the order is missing. Retry before
+        # giving up rather than surfacing a false "order failed" to the
+        # caller (see OrderVerificationError's docstring for why that
+        # distinction matters).
+        last_error: Optional[Exception] = None
+        for wait in (0, 1, 2, 4, 8):
+            if wait:
+                time.sleep(wait)
+            try:
+                return self.get_order(order_id)
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    last_error = e
+                    continue
+                raise
+        raise OrderVerificationError(
+            order_id, ticker,
+            f"Order {order_id} was created on {ticker} but could not be "
+            f"confirmed via GET after retries: {last_error}",
+        )
 
     def place_order(
         self,
