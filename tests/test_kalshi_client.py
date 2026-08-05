@@ -1,7 +1,80 @@
 """Tests for money parsing and orderbook parsing in bot/kalshi_client.py."""
+import requests
 import pytest
 
 from bot.kalshi_client import KalshiClient, Market, Order, OrderbookSnapshot
+
+
+def _client_for_request(monkeypatch, responses):
+    """Build a bare KalshiClient whose _session.request() replays `responses`
+    in order — either an exception instance to raise, or a fake response."""
+    client = object.__new__(KalshiClient)
+    client._base_url = "https://api.example.com"
+    client._base_path = ""
+    client._sign = lambda method, path: {}
+    monkeypatch.setattr("bot.kalshi_client.time.sleep", lambda _seconds: None)
+
+    calls = iter(responses)
+
+    class _FakeSession:
+        def request(self, *args, **kwargs):
+            item = next(calls)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    client._session = _FakeSession()
+    return client
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"status {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+class TestRequestRetry:
+    def test_retries_on_read_timeout_then_succeeds(self, monkeypatch):
+        client = _client_for_request(
+            monkeypatch,
+            [
+                requests.exceptions.ReadTimeout("timed out"),
+                _FakeResponse(200, {"ok": True}),
+            ],
+        )
+
+        result = client._get("/foo")
+
+        assert result == {"ok": True}
+
+    def test_retries_on_connection_error_then_succeeds(self, monkeypatch):
+        client = _client_for_request(
+            monkeypatch,
+            [
+                requests.exceptions.ConnectionError("refused"),
+                _FakeResponse(200, {"ok": True}),
+            ],
+        )
+
+        result = client._get("/foo")
+
+        assert result == {"ok": True}
+
+    def test_raises_after_exhausting_retries_on_timeout(self, monkeypatch):
+        client = _client_for_request(
+            monkeypatch,
+            [requests.exceptions.ReadTimeout("timed out")] * 4,
+        )
+
+        with pytest.raises(requests.exceptions.ReadTimeout):
+            client._get("/foo")
 
 
 class TestMoneyParsing:
