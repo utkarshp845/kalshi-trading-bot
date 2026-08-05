@@ -329,6 +329,63 @@ class TestMigrations:
             s.close()
 
 
+class TestGetMakerFillStats:
+    def _log_attempt(self, store, filled, requested, ticker, logged_at, status="live_no_fill"):
+        store.log_execution_attempt(
+            cycle_id="cycle-1",
+            symbol="BTC",
+            ticker=ticker,
+            side="yes",
+            trading_mode="live",
+            requested_contracts=requested,
+            filled_contracts=filled,
+            ask_price=0.10,
+            mid_price=0.10,
+            estimated_cost=0.10 * requested,
+            actual_cost=0.10 * filled,
+            status=status,
+            reason="",
+        )
+        # log_execution_attempt always stamps logged_at with real wall-clock
+        # time; pin it explicitly so lookback-window tests are deterministic.
+        store._conn.execute(
+            "UPDATE execution_attempts SET logged_at = ? WHERE ticker = ?",
+            (logged_at, ticker),
+        )
+        store._conn.commit()
+
+    def test_aggregates_filled_and_requested_across_attempts(self, store):
+        self._log_attempt(store, filled=2, requested=5, ticker="T-1", logged_at="2026-08-05T10:00:00+00:00")
+        self._log_attempt(store, filled=1, requested=5, ticker="T-2", logged_at="2026-08-05T11:00:00+00:00")
+
+        filled, requested, attempts = store.get_maker_fill_stats(symbol="BTC", n=40)
+
+        assert (filled, requested, attempts) == (3, 10, 2)
+
+    def test_lookback_days_excludes_stale_attempts(self, store):
+        # A fill from 30 days ago shouldn't count toward "recent" fill rate —
+        # without this cutoff, a cold streak with no new attempts freezes the
+        # stat on ancient data forever.
+        self._log_attempt(store, filled=5, requested=5, ticker="T-STALE", logged_at="2026-07-06T12:00:00+00:00")
+        self._log_attempt(store, filled=0, requested=5, ticker="T-RECENT", logged_at="2026-08-04T12:00:00+00:00")
+
+        filled, requested, attempts = store.get_maker_fill_stats(
+            symbol="BTC", n=40, before_iso="2026-08-05T12:00:00+00:00", lookback_days=7,
+        )
+
+        assert (filled, requested, attempts) == (0, 5, 1)
+
+    def test_without_lookback_days_stale_attempts_still_count(self, store):
+        self._log_attempt(store, filled=5, requested=5, ticker="T-STALE", logged_at="2026-07-06T12:00:00+00:00")
+        self._log_attempt(store, filled=0, requested=5, ticker="T-RECENT", logged_at="2026-08-04T12:00:00+00:00")
+
+        filled, requested, attempts = store.get_maker_fill_stats(
+            symbol="BTC", n=40, before_iso="2026-08-05T12:00:00+00:00",
+        )
+
+        assert (filled, requested, attempts) == (5, 10, 2)
+
+
 class TestGetSlippageFactor:
     def test_returns_none_when_insufficient_data(self, store):
         assert store.get_slippage_factor(min_trades=5) is None

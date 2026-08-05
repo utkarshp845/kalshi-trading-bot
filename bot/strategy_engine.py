@@ -94,6 +94,7 @@ def _maker_fill_probability(store, symbol: str, before_iso: Optional[str] = None
         symbol=symbol,
         n=cfg.MAKER_FILL_LOOKBACK_ATTEMPTS,
         before_iso=before_iso,
+        lookback_days=cfg.MAKER_FILL_LOOKBACK_DAYS,
     )
     if attempts < cfg.MAKER_FILL_MIN_ATTEMPTS or requested <= 0:
         return cfg.DEFAULT_MAKER_FILL_PROB
@@ -150,7 +151,16 @@ def decide_signal(
     imbalance_boost = feature.orderbook_imbalance * cfg.IMBALANCE_SCORE_WEIGHT if feature.orderbook_available else 0.0
     raw_score = realized_edge_proxy + imbalance_boost
     if trading_mode == "live" and maker_fill_prob is not None:
-        score = raw_score * maker_fill_prob - cfg.MAKER_MISS_PENALTY * (1.0 - maker_fill_prob)
+        effective_fill_prob = maker_fill_prob
+        if cfg.ENABLE_TAKER_ESCALATION:
+            # A measured 0% maker fill rate isn't a lost trade while taker
+            # escalation is on — it just means the fill comes from crossing
+            # the spread instead. Without this floor, maker_fill_prob==0.0
+            # multiplies raw_score to zero and rejects every signal outright
+            # (score_non_positive) no matter how large the edge, which also
+            # starves the stat of the very fills it needs to recover.
+            effective_fill_prob = max(effective_fill_prob, cfg.MIN_EFFECTIVE_MAKER_FILL_PROB)
+        score = raw_score * effective_fill_prob - cfg.MAKER_MISS_PENALTY * (1.0 - effective_fill_prob)
     else:
         score = raw_score
 

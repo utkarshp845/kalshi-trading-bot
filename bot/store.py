@@ -949,8 +949,16 @@ class Store:
         symbol: str,
         n: int = 40,
         before_iso: Optional[str] = None,
+        lookback_days: Optional[int] = None,
     ) -> tuple[int, int, int]:
-        """Return (filled contracts, requested contracts, attempts) for recent live maker attempts."""
+        """Return (filled contracts, requested contracts, attempts) for recent live maker attempts.
+
+        `lookback_days`, when given, drops attempts older than that many days
+        from the reference time (before_iso, or now). Without it, a cold
+        streak with no new attempts (e.g. because scoring itself went to 0
+        and stopped the bot from trading) freezes this stat on stale data
+        forever — see the maker-fill deadlock in commit history/PR discussion.
+        """
         sql = """
             SELECT filled_contracts, requested_contracts
               FROM execution_attempts
@@ -963,6 +971,12 @@ class Store:
         if before_iso:
             sql += " AND logged_at <= ?"
             params.append(before_iso)
+        if lookback_days is not None:
+            from datetime import timedelta as _td
+            reference = datetime.fromisoformat(before_iso) if before_iso else datetime.now(timezone.utc)
+            cutoff = (reference - _td(days=lookback_days)).isoformat()
+            sql += " AND logged_at >= ?"
+            params.append(cutoff)
         sql += " ORDER BY logged_at DESC LIMIT ?"
         params.append(n)
         rows = self._conn.execute(sql, params).fetchall()
