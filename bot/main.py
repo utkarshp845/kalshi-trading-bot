@@ -898,6 +898,38 @@ def _build_underlying_state(
     )
 
 
+# Reject reasons that only fire *after* a candidate has already cleared the
+# structural/pricing-sanity filters (prob_band, sigma_distance, spread, chain
+# integrity, ...). A candidate rejected for one of these is the closest thing
+# to "almost traded" — everything else can carry a misleadingly huge `edge`
+# (a contract at theo≈1.0 trading at 1¢ has edge≈1.0 while being nowhere near
+# tradeable) that would drown these out if sorted together by raw edge.
+_THRESHOLD_REJECT_REASONS = frozenset({
+    "edge_below_hurdle",
+    "score_non_positive",
+    "negative_recent_realized_edge",
+    "high_recent_model_error",
+    "negative_bucket_realized_edge",
+})
+
+
+def _select_near_misses(all_decisions: list, limit: int = 3) -> list:
+    """Pick the most useful rejected candidates to log for a zero-signal cycle.
+
+    Prefers candidates rejected on a money-side threshold (edge/score/recent
+    performance) over ones rejected on structural/pricing-sanity grounds,
+    since only the former are informative about "how close were we to
+    trading" — see _THRESHOLD_REJECT_REASONS.
+    """
+    threshold_candidates = [
+        d for d in all_decisions if d.reject_reason in _THRESHOLD_REJECT_REASONS
+    ]
+    pool = threshold_candidates or [
+        d for d in all_decisions if d.reject_reason != "already_held"
+    ]
+    return sorted(pool, key=lambda d: d.edge, reverse=True)[:limit]
+
+
 def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: bool) -> None:
     global _consecutive_price_feed_failures
     trading_mode = _resolved_trading_mode(dry_run)
@@ -1041,11 +1073,7 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
         # Zero-signal cycle: show the highest-edge candidates the funnel killed
         # and exactly how far each fell short, so a dry spell is diagnosable
         # from the log without querying the DB.
-        near_misses = sorted(
-            [d for d in all_decisions if d.reject_reason != "already_held"],
-            key=lambda d: d.edge,
-            reverse=True,
-        )[:3]
+        near_misses = _select_near_misses(all_decisions)
         for nm in near_misses:
             log.info(
                 "Best reject %s %s: edge=%.4f vs req=%.4f (short %+.4f)  score=%.4f  "
