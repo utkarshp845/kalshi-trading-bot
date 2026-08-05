@@ -4,7 +4,82 @@ from dataclasses import dataclass
 import bot.config as cfg
 import bot.main as main_mod
 from bot.kalshi_client import Order, Position
-from bot.models import AssetSnapshot, SourceSnapshot
+from bot.models import AssetSnapshot, SignalDecision, SourceSnapshot
+
+
+def _decision(reject_reason: str, edge: float, ticker: str = "T") -> SignalDecision:
+    """Minimal SignalDecision for near-miss selection tests; irrelevant fields
+    get inert defaults."""
+    return SignalDecision(
+        symbol="BTC",
+        ticker=ticker,
+        side="yes",
+        eligible=False,
+        score=0.0,
+        required_edge=0.025,
+        expected_slippage=0.0,
+        uncertainty_penalty=0.0,
+        realized_edge_proxy=0.0,
+        reject_reason=reject_reason,
+        theo_prob=0.5,
+        ask=0.5,
+        bid=0.49,
+        mid_price=0.495,
+        gross_edge=edge,
+        edge=edge,
+        fee=0.0,
+        hours_to_expiry=1.0,
+        strike=0.0,
+        distance_from_spot_sigma=0.0,
+        degraded=False,
+        chain_break_ratio=0.0,
+    )
+
+
+class TestSelectNearMisses:
+    def test_prefers_threshold_rejects_over_structural_edge_inflated_ones(self):
+        # A deep-ITM contract rejected on prob_band can carry edge close to 1.0
+        # despite being nowhere near tradeable — it must not drown out a real
+        # money-side near-miss with much smaller (but meaningful) edge.
+        decisions = [
+            _decision("prob_band", edge=0.9750, ticker="STRUCTURAL"),
+            _decision("score_non_positive", edge=0.7141, ticker="THRESHOLD"),
+        ]
+
+        result = main_mod._select_near_misses(decisions)
+
+        assert [d.ticker for d in result] == ["THRESHOLD"]
+
+    def test_falls_back_to_structural_rejects_when_no_threshold_candidates(self):
+        decisions = [
+            _decision("prob_band", edge=0.99, ticker="A"),
+            _decision("spread_too_wide", edge=0.10, ticker="B"),
+        ]
+
+        result = main_mod._select_near_misses(decisions)
+
+        assert [d.ticker for d in result] == ["A", "B"]
+
+    def test_excludes_already_held_from_fallback(self):
+        decisions = [
+            _decision("already_held", edge=0.99, ticker="HELD"),
+            _decision("prob_band", edge=0.5, ticker="STRUCTURAL"),
+        ]
+
+        result = main_mod._select_near_misses(decisions)
+
+        assert [d.ticker for d in result] == ["STRUCTURAL"]
+
+    def test_respects_limit_and_sorts_descending_by_edge(self):
+        decisions = [
+            _decision("edge_below_hurdle", edge=0.01, ticker="LOW"),
+            _decision("score_non_positive", edge=0.71, ticker="HIGH"),
+            _decision("score_non_positive", edge=0.46, ticker="MID"),
+        ]
+
+        result = main_mod._select_near_misses(decisions, limit=2)
+
+        assert [d.ticker for d in result] == ["HIGH", "MID"]
 
 
 class _StoreWithBias:

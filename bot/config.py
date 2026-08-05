@@ -126,8 +126,10 @@ BUCKET_EDGE_MIN_TRADES: int = _int("BUCKET_EDGE_MIN_TRADES", 8)
 BUCKET_EDGE_LOOKBACK_DAYS: int = _int("BUCKET_EDGE_LOOKBACK_DAYS", 21)
 BUCKET_EDGE_MIN_AVG_REALIZED: float = _float("BUCKET_EDGE_MIN_AVG_REALIZED", 0.0)
 MAKER_FILL_LOOKBACK_ATTEMPTS: int = _int("MAKER_FILL_LOOKBACK_ATTEMPTS", 40)
+MAKER_FILL_LOOKBACK_DAYS: int = _int("MAKER_FILL_LOOKBACK_DAYS", 7)  # attempts older than this age out of the fill-rate stat — without a time bound, a cold streak with zero new attempts (e.g. because scoring itself hit 0 and stopped the bot from trading) freezes it on stale data forever
 MAKER_FILL_MIN_ATTEMPTS: int = _int("MAKER_FILL_MIN_ATTEMPTS", 8)
 DEFAULT_MAKER_FILL_PROB: float = _float("DEFAULT_MAKER_FILL_PROB", 0.50)
+MIN_EFFECTIVE_MAKER_FILL_PROB: float = _float("MIN_EFFECTIVE_MAKER_FILL_PROB", 0.15)  # floor applied to maker_fill_prob when scoring, only while ENABLE_TAKER_ESCALATION is on — a measured 0% maker fill rate isn't a lost trade in that regime (it escalates to taker), so it must not multiply raw_score to zero and kill every signal outright
 MAKER_MISS_PENALTY: float = _float("MAKER_MISS_PENALTY", 0.005)  # was 0.01 — a missed maker fill costs nothing but time; don't let it sink marginal signals
 
 # --- Risk ---

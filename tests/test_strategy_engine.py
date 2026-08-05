@@ -35,7 +35,7 @@ class _Store:
     def get_bucket_realized_stats(self, **kwargs):
         return self.bucket_stats
 
-    def get_maker_fill_stats(self, symbol, n, before_iso=None):
+    def get_maker_fill_stats(self, symbol, n, before_iso=None, lookback_days=None):
         return self.maker_stats
 
 
@@ -233,3 +233,49 @@ def test_live_mode_scales_score_by_maker_fill_probability(monkeypatch):
 
     assert decision.maker_fill_prob == 0.2
     assert decision.score < decision.realized_edge_proxy
+
+
+def test_zero_maker_fill_prob_does_not_zero_out_score_when_taker_escalation_on(monkeypatch):
+    # A measured 0% maker fill rate isn't a lost trade while taker escalation
+    # is on (it just escalates to a taker fill), so it must not multiply a
+    # large edge down to nothing and reject every signal via score_non_positive.
+    import bot.config as cfg
+
+    monkeypatch.setattr(cfg, "LIVE_MIN_REQUIRED_EDGE", 0.10)
+    monkeypatch.setattr(cfg, "COLD_START_MIN_EDGE", 0.10)
+    monkeypatch.setattr(cfg, "MAKER_FILL_MIN_ATTEMPTS", 2)
+    monkeypatch.setattr(cfg, "MAKER_MISS_PENALTY", 0.005)
+    monkeypatch.setattr(cfg, "ENABLE_TAKER_ESCALATION", True)
+    monkeypatch.setattr(cfg, "MIN_EFFECTIVE_MAKER_FILL_PROB", 0.15)
+    store = _Store(
+        realized_edges=[0.10] * 20,
+        errors=[0.05] * 20,
+        maker_stats=(0, 10, 8),  # 0 filled out of 10 requested across 8 attempts
+    )
+
+    decision = decide_signal(store, _asset(), _feature(edge=0.40), held_tickers=set(), trading_mode="live")
+
+    assert decision.maker_fill_prob == 0.0
+    assert decision.score > 0
+    assert decision.eligible is True
+
+
+def test_zero_maker_fill_prob_fully_suppresses_score_when_taker_escalation_off(monkeypatch):
+    import bot.config as cfg
+
+    monkeypatch.setattr(cfg, "LIVE_MIN_REQUIRED_EDGE", 0.10)
+    monkeypatch.setattr(cfg, "COLD_START_MIN_EDGE", 0.10)
+    monkeypatch.setattr(cfg, "MAKER_FILL_MIN_ATTEMPTS", 2)
+    monkeypatch.setattr(cfg, "MAKER_MISS_PENALTY", 0.005)
+    monkeypatch.setattr(cfg, "ENABLE_TAKER_ESCALATION", False)
+    store = _Store(
+        realized_edges=[0.10] * 20,
+        errors=[0.05] * 20,
+        maker_stats=(0, 10, 8),
+    )
+
+    decision = decide_signal(store, _asset(), _feature(edge=0.40), held_tickers=set(), trading_mode="live")
+
+    assert decision.maker_fill_prob == 0.0
+    assert decision.score == -0.005
+    assert decision.reject_reason == "score_non_positive"

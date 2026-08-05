@@ -266,9 +266,20 @@ class KalshiClient:
         url = self._base_url + path
         for attempt in range(4):
             headers = self._sign(method, self._base_path + path)
-            resp = self._session.request(
-                method, url, headers=headers, params=params, json=body, timeout=15
-            )
+            try:
+                resp = self._session.request(
+                    method, url, headers=headers, params=params, json=body, timeout=15
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt >= 3:
+                    raise
+                wait = 2 ** attempt
+                log.warning(
+                    "Network error (%s) on %s %s — retrying in %ds (attempt %d/4)",
+                    e.__class__.__name__, method, path, wait, attempt + 1,
+                )
+                time.sleep(wait)
+                continue
             if resp.status_code == 429:
                 wait = 2 ** attempt
                 log.warning("Rate limited (429) on %s %s — retrying in %ds", method, path, wait)
