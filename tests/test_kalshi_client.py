@@ -2,7 +2,7 @@
 import requests
 import pytest
 
-from bot.kalshi_client import KalshiClient, Market, Order, OrderbookSnapshot
+from bot.kalshi_client import KalshiClient, Market, Order, OrderbookSnapshot, OrderVerificationError
 
 
 def _client_for_request(monkeypatch, responses):
@@ -310,6 +310,69 @@ class TestPlaceOrderV2:
         client._post = lambda path, body: {"fill_count": "0.00"}  # malformed/unexpected response
 
         with pytest.raises(ValueError):
+            client.place_order("KXBTC-26APR4PM-B95000", "yes", 10, 0.45)
+
+
+def _http_404() -> requests.exceptions.HTTPError:
+    resp = requests.models.Response()
+    resp.status_code = 404
+    return requests.exceptions.HTTPError("404 Client Error: Not Found", response=resp)
+
+
+class TestCreateOrderV2Verification:
+    """Confirmed in production (2026-08-05): GET /portfolio/orders/{id} can
+    404 for several seconds immediately after a real V2 create succeeds —
+    a read-after-write delay, not the order missing. These cover the retry
+    that absorbs it and the explicit OrderVerificationError raised only
+    after retries are exhausted."""
+
+    def test_retries_through_404_then_returns_order(self, monkeypatch):
+        monkeypatch.setattr("bot.kalshi_client.time.sleep", lambda _seconds: None)
+        client = object.__new__(KalshiClient)
+        client._post = lambda path, body: {"order_id": "o-1"}
+
+        calls = {"n": 0}
+
+        def _get_order(order_id):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise _http_404()
+            return Order.from_dict(_order_stub(order_id, status="executed"))
+
+        client.get_order = _get_order
+
+        order = client.place_order("KXBTC-26APR4PM-B95000", "yes", 10, 0.45)
+
+        assert calls["n"] == 3
+        assert order.order_id == "o-1"
+        assert order.status == "executed"
+
+    def test_raises_order_verification_error_after_retries_exhausted(self, monkeypatch):
+        monkeypatch.setattr("bot.kalshi_client.time.sleep", lambda _seconds: None)
+        client = object.__new__(KalshiClient)
+        client._post = lambda path, body: {"order_id": "o-999"}
+        client.get_order = lambda order_id: (_ for _ in ()).throw(_http_404())
+
+        with pytest.raises(OrderVerificationError) as exc_info:
+            client.place_order("KXBTC-26APR4PM-B95000", "yes", 10, 0.45)
+
+        assert exc_info.value.order_id == "o-999"
+        assert exc_info.value.ticker == "KXBTC-26APR4PM-B95000"
+
+    def test_non_404_http_error_from_get_order_propagates_immediately(self, monkeypatch):
+        monkeypatch.setattr("bot.kalshi_client.time.sleep", lambda _seconds: None)
+        client = object.__new__(KalshiClient)
+        client._post = lambda path, body: {"order_id": "o-1"}
+
+        resp = requests.models.Response()
+        resp.status_code = 500
+
+        def _get_order(order_id):
+            raise requests.exceptions.HTTPError("500 Server Error", response=resp)
+
+        client.get_order = _get_order
+
+        with pytest.raises(requests.exceptions.HTTPError):
             client.place_order("KXBTC-26APR4PM-B95000", "yes", 10, 0.45)
 
 

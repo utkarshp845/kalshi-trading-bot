@@ -25,7 +25,7 @@ from bot.deribit_iv import get_atm_iv
 from bot.fees import fee_per_contract
 from bot.feature_builder import build_asset_snapshot, build_market_features
 from bot.implied_vol import fit_cycle_iv
-from bot.kalshi_client import KalshiClient, Market, Order, Position
+from bot.kalshi_client import KalshiClient, Market, Order, OrderVerificationError, Position
 from bot.models import AssetSnapshot
 from bot.monitor import alert
 from bot.portfolio_risk import PortfolioRisk
@@ -632,6 +632,23 @@ def _http_error_detail(e: Exception) -> str:
         return f"{e} — body={text}" if text else str(e)
 
 
+def _alert_unverified_order(e: OrderVerificationError, context: str) -> None:
+    """
+    Handle an OrderVerificationError: the order almost certainly exists on
+    Kalshi's book (the create call succeeded) but we couldn't confirm its
+    status. Alert loudly for manual reconciliation — do NOT let the caller
+    fall back to placing another order for the same signal, which is what
+    turned this exact ambiguity into a real doubled position on 2026-08-05.
+    """
+    alert(
+        f"Order verification failed after {context} on {e.ticker} "
+        f"(order_id={e.order_id}) — the order was created but its status "
+        f"couldn't be confirmed. It likely exists on Kalshi's book; check "
+        f"manually before assuming it didn't happen. {e}",
+        level="ERROR",
+    )
+
+
 def _execute_with_price_improvement(
     kalshi: KalshiClient,
     ticker: str,
@@ -662,7 +679,11 @@ def _execute_with_price_improvement(
     passive_price = max(0.01, min(0.99, passive_price))
 
     if not cfg.ENABLE_PRICE_IMPROVEMENT:
-        order = kalshi.place_order(ticker, side, contracts, passive_price, post_only=True)
+        try:
+            order = kalshi.place_order(ticker, side, contracts, passive_price, post_only=True)
+        except OrderVerificationError as e:
+            _alert_unverified_order(e, "maker-first entry")
+            return []
         return [order] if order is not None else []
 
     try:
@@ -674,6 +695,12 @@ def _execute_with_price_improvement(
     try:
         order1 = kalshi.place_order(ticker, side, contracts, passive_price, post_only=True)
         log.info("Maker-first entry: placed %d @ passive=%.3f (ask=%.3f)", contracts, passive_price, ask_price)
+    except OrderVerificationError as e:
+        # The order was created — do NOT fall back to a taker order here.
+        # That's exactly what turned an unconfirmed-but-real maker fill into
+        # a doubled position on 2026-08-05.
+        _alert_unverified_order(e, "maker-first entry")
+        return []
     except requests.exceptions.HTTPError as e:
         if e.response is not None and 400 <= e.response.status_code < 500:
             if taker_edge is None or required_edge is None:
@@ -697,6 +724,9 @@ def _execute_with_price_improvement(
                 log.info("Taker fallback: %s x%d @ %.3f → id=%s status=%s",
                          ticker, contracts, ask_price, taker.order_id[:8], taker.status)
                 return [taker]
+            except OrderVerificationError as e2:
+                _alert_unverified_order(e2, "taker fallback")
+                return []
             except Exception as e2:
                 log.warning("Taker fallback also failed for %s: %s", ticker, _http_error_detail(e2))
                 return []
@@ -792,6 +822,8 @@ def _execute_with_price_improvement(
                     current_ask, taker.order_id[:8], taker.status,
                 )
                 return [order1, taker] if filled > 0 else [taker]
+            except OrderVerificationError as e:
+                _alert_unverified_order(e, "taker escalation")
             except Exception as e:
                 log.warning("Taker escalation failed for %s: %s", ticker, _http_error_detail(e))
         else:

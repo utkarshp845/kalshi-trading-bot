@@ -9,7 +9,7 @@ import requests
 
 import bot.config as cfg
 import bot.main as main_mod
-from bot.kalshi_client import Market, Order
+from bot.kalshi_client import Market, Order, OrderVerificationError
 
 
 def _order(order_id: str, count: int, fill_count: int, fill_cost: float, price: float) -> Order:
@@ -267,6 +267,48 @@ class TestTakerFallback:
         assert len(kalshi.place_calls) == 1  # only the initial post_only attempt
 
 
+class TestOrderVerificationErrorDoesNotDoubleOrder:
+    """Regression coverage for the 2026-08-05 incident: an unverified-but-
+    real maker fill was followed by a taker fallback for the same signal,
+    doubling the position. OrderVerificationError must never trigger a
+    fallback/retry — see bot.kalshi_client.OrderVerificationError."""
+
+    def test_maker_verification_failure_does_not_attempt_taker_fallback(self, monkeypatch):
+        alerts = []
+        monkeypatch.setattr(main_mod, "alert", lambda msg, level="ERROR": alerts.append((msg, level)))
+        error = OrderVerificationError("o-1", "KXBTC-26APR4PM-B95000", "could not confirm")
+        kalshi = FakeKalshi(place_results=[error])
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,  # would normally clear the fallback hurdle
+        )
+
+        assert orders == []
+        assert len(kalshi.place_calls) == 1  # no taker fallback attempted
+        assert len(alerts) == 1
+        assert alerts[0][1] == "ERROR"
+        assert "o-1" in alerts[0][0]
+
+    def test_taker_fallback_verification_failure_also_alerts_without_retry(self, monkeypatch):
+        alerts = []
+        monkeypatch.setattr(main_mod, "alert", lambda msg, level="ERROR": alerts.append((msg, level)))
+        error = OrderVerificationError("o-2", "KXBTC-26APR4PM-B95000", "could not confirm")
+        kalshi = FakeKalshi(place_results=[_http_error(400), error])
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=5, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,
+        )
+
+        assert orders == []
+        assert len(kalshi.place_calls) == 2  # maker rejected, taker attempted once, no more
+        assert len(alerts) == 1
+        assert "o-2" in alerts[0][0]
+
+
 class TestTakerEscalationAfterMakerTimeout:
     def test_maker_timeout_escalates_to_taker_when_edge_clears(self):
         unfilled = _order("o1", count=5, fill_count=0, fill_cost=0.0, price=0.40)
@@ -349,6 +391,27 @@ class TestTakerEscalationAfterMakerTimeout:
 
         assert orders == []
         assert len(kalshi.place_calls) == 1
+
+    def test_escalation_verification_failure_alerts_and_returns_maker_fill_only(self, monkeypatch):
+        alerts = []
+        monkeypatch.setattr(main_mod, "alert", lambda msg, level="ERROR": alerts.append((msg, level)))
+        partial = _order("o1", count=10, fill_count=3, fill_cost=1.20, price=0.40)
+        error = OrderVerificationError("o-escalated", "KXBTC-26APR4PM-B95000", "could not confirm")
+        kalshi = FakeKalshi(place_results=[partial, error], get_results={"o1": partial})
+
+        orders = main_mod._execute_with_price_improvement(
+            kalshi=kalshi, ticker="KXBTC-26APR4PM-B95000", side="yes",
+            contracts=10, ask_price=0.45, mid_price=0.42, dry_run=False,
+            taker_edge=0.30, required_edge=0.25,
+        )
+
+        # The confirmed partial maker fill is still returned — only the
+        # unconfirmed escalation attempt is withheld, and no further
+        # placement is attempted for the remainder.
+        assert [o.order_id for o in orders] == ["o1"]
+        assert len(kalshi.place_calls) == 2
+        assert len(alerts) == 1
+        assert "o-escalated" in alerts[0][0]
 
 
 class TestSigtermDuringMakerWait:
