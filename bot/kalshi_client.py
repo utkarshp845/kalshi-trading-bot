@@ -373,6 +373,24 @@ class KalshiClient:
         data = self._get(path)
         return data.get("market", data)
 
+    def get_market_raw(self, ticker: str) -> dict[str, Any]:
+        """Raw (unparsed) /markets/{ticker} response dict.
+
+        Unlike get_market(), which returns the typed Market dataclass, this
+        keeps every field Kalshi sends — including `result`,
+        `settlement_value_dollars`, and `settlement_ts`, none of which
+        Market.from_dict carries. Outcome backfill needs those settlement
+        fields; using get_market().__dict__ silently drops them and makes
+        every settlement lookup fail with no error (see outcome-backfill
+        incident, Aug 2026 — Market never had settlement fields, and
+        /historical/markets/{ticker} 404s for anything not yet archived,
+        so this raw live-market path is the only route that actually works
+        for recently-closed markets).
+        """
+        path = f"/markets/{ticker}"
+        data = self._get(path)
+        return data.get("market", data)
+
     # ------------------------------------------------------------------
     # Portfolio
     # ------------------------------------------------------------------
