@@ -306,6 +306,8 @@ def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: st
         t for t in candidates if _outcome_backfill_next_attempt.get(t, 0.0) <= now
     ][: cfg.OUTCOME_BACKFILL_MAX_PER_CYCLE]
     deadline = now + cfg.OUTCOME_BACKFILL_TIME_BUDGET_SEC
+    recorded = 0
+    skipped = 0
     for ticker in tickers:
         if time.monotonic() > deadline:
             log.info(
@@ -315,13 +317,22 @@ def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: st
             )
             break
         _outcome_backfill_next_attempt[ticker] = now + cfg.OUTCOME_BACKFILL_RETRY_SEC
+        # Try the live /markets/{ticker} endpoint first: it serves both open
+        # and recently-finalized markets (confirmed against prod — a market
+        # closed 2 days prior still 404s on /historical/markets/{ticker},
+        # which only serves markets already archived to Kalshi's historical
+        # DB, an unknown and apparently long lag). get_market_raw() keeps the
+        # raw dict (result/settlement_value_dollars survive); the typed
+        # Market dataclass does not carry those fields at all, so routing
+        # through it here made every settlement lookup fail silently.
         try:
-            market = kalshi.get_historical_market(ticker)
+            market = kalshi.get_market_raw(ticker)
         except Exception:
             try:
-                market = kalshi.get_market(ticker).__dict__
+                market = kalshi.get_historical_market(ticker)
             except Exception as exc:
                 log.debug("Outcome backfill skipped for %s: %s", ticker, exc)
+                skipped += 1
                 continue
 
         result = str(market.get("result") or "").strip().lower()
@@ -333,6 +344,7 @@ def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: st
         else:
             settlement_value = None
         if settlement_value is None:
+            skipped += 1
             continue
         store.upsert_market_outcome(
             ticker=ticker,
@@ -342,6 +354,13 @@ def _backfill_market_outcomes(kalshi: KalshiClient, store: Store, before_iso: st
             settlement_ts=str(market.get("settlement_ts") or market.get("expiration_time") or ""),
         )
         _outcome_backfill_next_attempt.pop(ticker, None)
+        recorded += 1
+
+    if tickers:
+        log.info(
+            "Outcome backfill: %d recorded, %d not yet settled/skipped, %d candidate(s) this cycle",
+            recorded, skipped, len(tickers),
+        )
 
 
 def _execute_passive_exit(

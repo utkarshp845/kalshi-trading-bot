@@ -210,12 +210,21 @@ class _StoreForBackfill:
 
 
 class _KalshiForBackfill:
-    def __init__(self, settled):
+    def __init__(self, settled, historical_only=frozenset()):
         self.settled = settled  # tickers that have a settlement available
+        self.historical_only = historical_only  # tickers only reachable via /historical
         self.fetches = []
 
+    def get_market_raw(self, ticker):
+        self.fetches.append(("live", ticker))
+        if ticker in self.historical_only:
+            raise RuntimeError("404 not found")
+        if ticker in self.settled:
+            return {"result": "yes", "close_time": "2026-07-12T00:00:00Z", "settlement_ts": "2026-07-12T00:05:00Z"}
+        return {"result": "", "settlement_value_dollars": None}
+
     def get_historical_market(self, ticker):
-        self.fetches.append(ticker)
+        self.fetches.append(("historical", ticker))
         if ticker in self.settled:
             return {"result": "yes", "close_time": "2026-07-12T00:00:00Z", "settlement_ts": "2026-07-12T00:05:00Z"}
         return {"result": "", "settlement_value_dollars": None}
@@ -232,7 +241,7 @@ class TestBackfillThrottle:
         main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:00:00+00:00")
         main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:01:00+00:00")
 
-        assert kalshi.fetches == ["T-UNSETTLED"]  # second cycle skips it
+        assert kalshi.fetches == [("live", "T-UNSETTLED")]  # second cycle skips it
         assert store.outcomes == []
 
     def test_settled_ticker_upserted_and_throttle_entry_cleared(self):
@@ -253,6 +262,35 @@ class TestBackfillThrottle:
         main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:00:00+00:00")
 
         assert len(kalshi.fetches) == 3
+
+    def test_settled_ticker_only_reachable_via_historical_fallback(self):
+        # Regression: /historical/markets/{ticker} 404s for anything not yet
+        # archived (confirmed against prod), so the live endpoint must be
+        # tried first and the historical endpoint used as a fallback for
+        # genuinely old/archived tickers — not the other way around.
+        store = _StoreForBackfill(["T-OLD-SETTLED"])
+        kalshi = _KalshiForBackfill(settled={"T-OLD-SETTLED"}, historical_only={"T-OLD-SETTLED"})
+
+        main_mod._backfill_market_outcomes(kalshi, store, before_iso="2026-07-12T01:00:00+00:00")
+
+        assert kalshi.fetches == [("live", "T-OLD-SETTLED"), ("historical", "T-OLD-SETTLED")]
+        assert len(store.outcomes) == 1
+        assert store.outcomes[0]["settlement_value"] == 1.0
+
+    def test_typed_market_dataclass_would_drop_settlement_fields(self):
+        # Regression for the real incident: kalshi.get_market(ticker).__dict__
+        # (the typed Market dataclass) never carried result/
+        # settlement_value_dollars/settlement_ts, so every backfill attempt
+        # that fell through to it silently recorded nothing, forever. Assert
+        # the dataclass still doesn't have these fields, so nobody
+        # accidentally routes backfill through it again without noticing.
+        from bot.kalshi_client import Market
+        m = Market(
+            ticker="X", event_ticker="X-EVT", status="finalized", close_time="2026-01-01T00:00:00Z",
+            yes_ask=1.0, no_ask=0.0, yes_bid=1.0, no_bid=0.0, last_price=1.0,
+        )
+        assert "result" not in m.__dict__
+        assert "settlement_value_dollars" not in m.__dict__
 
     def test_time_budget_stops_fetching(self, monkeypatch):
         monkeypatch.setattr(cfg, "OUTCOME_BACKFILL_TIME_BUDGET_SEC", -1.0)  # budget already exhausted
