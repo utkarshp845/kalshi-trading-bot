@@ -35,6 +35,36 @@ def _spread_ok(bid: float, ask: float) -> bool:
     return _pct_spread(bid, ask) <= cfg.MAX_BID_ASK_PCT_SPREAD
 
 
+def _calibrate_prob(
+    raw_prob: float,
+    calibration: Optional[dict[int, tuple[float, float, int]]],
+    bucket_edges: tuple[float, ...],
+    max_haircut: float,
+) -> float:
+    """Apply a real-settlement-derived bucket correction to a raw model prob.
+
+    `calibration` is store.get_settlement_calibration_by_bucket()'s output:
+    {bucket_index: (bias, avg_theo_prob, n)}, already gated on a minimum
+    trade count per bucket. Buckets with no entry (insufficient history) or
+    probabilities outside the configured band pass through unchanged — this
+    is a correction, not a replacement for the model, and it can only act
+    where there's real evidence to act on.
+    """
+    if not calibration:
+        return raw_prob
+    if raw_prob < bucket_edges[0] or raw_prob >= bucket_edges[-1]:
+        return raw_prob
+    for idx in range(len(bucket_edges) - 1):
+        if bucket_edges[idx] <= raw_prob < bucket_edges[idx + 1]:
+            entry = calibration.get(idx)
+            if entry is None:
+                return raw_prob
+            bias, _avg_theo, _n = entry
+            bias = max(-max_haircut, min(max_haircut, bias))
+            return max(0.0, min(1.0, raw_prob + bias))
+    return raw_prob
+
+
 def build_asset_snapshot(
     symbol: str,
     series_ticker: str,
@@ -103,7 +133,11 @@ def build_market_features(
     markets: list[Market],
     fee: float,
     maker_entry: bool = False,
+    calibration: Optional[dict[int, tuple[float, float, int]]] = None,
 ) -> list[MarketFeature]:
+    """`calibration` is store.get_settlement_calibration_by_bucket()'s output
+    (or None/empty to leave probabilities uncorrected). See _calibrate_prob.
+    """
     grouped: dict[str, list[dict]] = defaultdict(list)
     raw: list[dict] = []
 
@@ -115,8 +149,14 @@ def build_market_features(
         if hours <= 0:
             continue
         T_years = hours / 8760.0
-        yes_theo = calc_prob(asset.spot, strike, T_years, asset.sigma_adjusted, mu=asset.mu)
-        no_theo = 1.0 - yes_theo
+        yes_theo_raw = calc_prob(asset.spot, strike, T_years, asset.sigma_adjusted, mu=asset.mu)
+        no_theo_raw = 1.0 - yes_theo_raw
+        # Each side is calibrated independently against its own bucket's real
+        # settlement history — after correction they need not sum back to 1;
+        # that asymmetry is the point (e.g. a "favorite" bucket can be badly
+        # overconfident while the complementary "longshot" bucket is fine).
+        yes_theo = _calibrate_prob(yes_theo_raw, calibration, cfg.CALIBRATION_BUCKET_EDGES, cfg.CALIBRATION_MAX_HAIRCUT)
+        no_theo = _calibrate_prob(no_theo_raw, calibration, cfg.CALIBRATION_BUCKET_EDGES, cfg.CALIBRATION_MAX_HAIRCUT)
 
         # Maker orders fill at the bid; taker orders fill at ask. Fees are
         # computed with Kalshi's price-dependent formula for a one-contract

@@ -76,6 +76,80 @@ class TestGetUnfilledOrders:
         unfilled = store.get_unfilled_orders()
         assert order.order_id not in unfilled
 
+    def test_honors_max_age_hours_not_just_todays_date(self, store):
+        """Regression test: get_unfilled_orders() used to hardcode a cutoff of
+        "today's UTC date" and ignore max_age_hours entirely, so any order
+        logged before the current UTC day was silently excluded forever, even
+        when it still needed a settlement refresh. A 60-hour-old order should
+        still surface with the default 48h window would exclude it, but a
+        wider window should include it.
+        """
+        order = _make_order(status="filled", order_id="test-order-old")
+        store.log_order(order, theo_prob=0.67, gross_edge=0.22, edge=0.15, fee=0.07)
+        store._conn.execute(
+            "UPDATE orders SET logged_at = datetime('now', '-60 hours') WHERE order_id = ?",
+            (order.order_id,),
+        )
+        store._conn.commit()
+        assert order.order_id not in store.get_unfilled_orders(max_age_hours=48)
+        assert order.order_id in store.get_unfilled_orders(max_age_hours=72)
+
+
+class TestReconcileSettledValuesFromOutcomes:
+    def test_backfills_regardless_of_order_age_or_status(self, store):
+        """The historical bug: an old order stuck outside get_unfilled_orders()'s
+        window could never get settled_value written by update_order_fill(),
+        even once market_outcomes had the real result. This reconciliation
+        path must not depend on order age or on re-polling order status.
+        """
+        order = _make_order(status="filled", fill_count=1, side="yes")
+        store.log_order(order, theo_prob=0.67, gross_edge=0.22, edge=0.15, fee=0.07)
+        store._conn.execute(
+            "UPDATE orders SET logged_at = datetime('now', '-90 days'), fill_count = 1 WHERE order_id = ?",
+            (order.order_id,),
+        )
+        store.upsert_market_outcome(
+            ticker=order.ticker, result="yes", settlement_value=1.0,
+            close_time="2026-04-13T16:00:00Z", settlement_ts="2026-04-13T16:00:01Z",
+        )
+        n = store.reconcile_settled_values_from_outcomes()
+        assert n == 1
+        row = store._conn.execute(
+            "SELECT settled_value FROM orders WHERE order_id = ?", (order.order_id,)
+        ).fetchone()
+        assert row[0] == 1.0
+
+    def test_inverts_settlement_value_for_no_side(self, store):
+        order = _make_order(status="filled", fill_count=1, side="no", order_id="test-no-order")
+        store.log_order(order, theo_prob=0.30, gross_edge=0.20, edge=0.13, fee=0.07)
+        store._conn.execute(
+            "UPDATE orders SET fill_count = 1 WHERE order_id = ?", (order.order_id,)
+        )
+        store.upsert_market_outcome(
+            ticker=order.ticker, result="yes", settlement_value=1.0,
+            close_time="2026-04-13T16:00:00Z", settlement_ts="2026-04-13T16:00:01Z",
+        )
+        store.reconcile_settled_values_from_outcomes()
+        row = store._conn.execute(
+            "SELECT settled_value FROM orders WHERE order_id = ?", (order.order_id,)
+        ).fetchone()
+        assert row[0] == 0.0  # "no" side loses when market settles "yes"
+
+    def test_is_idempotent_and_skips_already_settled(self, store):
+        order = _make_order(status="settled", fill_count=1, side="yes")
+        store.log_order(order, theo_prob=0.67, gross_edge=0.22, edge=0.15, fee=0.07)
+        store._conn.execute(
+            "UPDATE orders SET fill_count = 1, settled_value = 1.0 WHERE order_id = ?",
+            (order.order_id,),
+        )
+        store._conn.commit()
+        store.upsert_market_outcome(
+            ticker=order.ticker, result="no", settlement_value=0.0,
+            close_time="2026-04-13T16:00:00Z", settlement_ts="2026-04-13T16:00:01Z",
+        )
+        n = store.reconcile_settled_values_from_outcomes()
+        assert n == 0  # already labeled — must not be overwritten
+
 
 class TestLogOrder:
     def test_order_persisted(self, store):

@@ -10,7 +10,7 @@ Tables:
 import csv
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from bot.kalshi_client import Order
@@ -258,6 +258,8 @@ class Store:
                 ON market_snapshots(close_time, ticker);
             CREATE INDEX IF NOT EXISTS idx_market_snapshots_ticker
                 ON market_snapshots(ticker);
+            CREATE INDEX IF NOT EXISTS idx_orders_ticker
+                ON orders(ticker);
         """)
         self._conn.commit()
 
@@ -686,8 +688,20 @@ class Store:
     # ------------------------------------------------------------------
 
     def get_unfilled_orders(self, max_age_hours: int = 48) -> list[str]:
-        """Return order_ids that still need fill/settlement refresh."""
-        cutoff = datetime.now(timezone.utc).isoformat()[:10]  # today's date prefix
+        """Return order_ids that still need fill/settlement refresh.
+
+        BUG (fixed 2026-08-10): this used to hardcode `cutoff` to today's UTC
+        date, ignoring `max_age_hours` entirely. That meant any order logged
+        before the current UTC day permanently dropped out of this query —
+        and update_order_fill(), which is the only place orders.settled_value
+        ever gets written, is only ever called on rows this query returns. In
+        production this left 214+ historical fills stuck at settled_value=NULL
+        indefinitely, even after market_outcomes had the real result, which in
+        turn starved every settlement-based self-calibration/halt of data.
+        See reconcile_settled_values_from_outcomes() for the direct fix that
+        also backfills orders already stuck in that state.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
         rows = self._conn.execute("""
             SELECT order_id FROM orders
              WHERE logged_at >= ?
@@ -698,6 +712,44 @@ class Store:
                )
         """, (cutoff,)).fetchall()
         return [r[0] for r in rows]
+
+    def reconcile_settled_values_from_outcomes(self) -> int:
+        """Directly backfill orders.settled_value from market_outcomes.
+
+        update_order_fill() only ever writes settled_value when we happen to
+        re-poll that specific order's own Kalshi-side status AND it has
+        already flipped to 'settled'/'expired' — two conditions that, given
+        the get_unfilled_orders() bug above, silently never held for most
+        historical orders. market_outcomes is populated independently (from
+        market_snapshots, not from orders) and isn't subject to that bug, so
+        it's often ahead of what individual order-status polling has caught.
+
+        This does the join directly and unconditionally, so a known outcome
+        propagates to every matching order regardless of that order's polled
+        status or age. Idempotent and cheap (indexed join, WHERE ... IS NULL
+        skips already-settled rows) — safe to call every cycle.
+        """
+        cur = self._conn.execute("""
+            UPDATE orders
+               SET settled_value = (
+                   SELECT CASE WHEN orders.side = 'yes'
+                               THEN mo.settlement_value
+                               ELSE 1.0 - mo.settlement_value
+                          END
+                     FROM market_outcomes mo
+                    WHERE mo.ticker = orders.ticker
+               )
+             WHERE action = 'buy'
+               AND fill_count > 0
+               AND settled_value IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM market_outcomes mo
+                    WHERE mo.ticker = orders.ticker
+                      AND mo.settlement_value IS NOT NULL
+               )
+        """)
+        self._conn.commit()
+        return cur.rowcount
 
     def get_recent_iv_rv_ratios(self, n: int = 20) -> list[float]:
         """Return the last n iv_rv_ratio values from the runs table (non-NULL only)."""
@@ -828,6 +880,71 @@ class Store:
         if row is None or row[1] is None or row[1] < min_trades:
             return None
         return float(row[0])
+
+    def get_settlement_calibration_by_bucket(
+        self,
+        bucket_edges: tuple[float, ...],
+        min_trades: int,
+        lookback_days: int,
+    ) -> dict[int, tuple[float, float, int]]:
+        """Per-probability-bucket calibration bias from real settlements.
+
+        `bucket_edges` (e.g. (0.05, 0.30, 0.70, 0.90)) splits contract_theo_prob
+        into len(edges)-1 buckets: [e0,e1), [e1,e2), ..., [e_{n-2}, e_{n-1}].
+        Buckets below e0 or at/above the last edge are not corrected (outside
+        the configured band).
+
+        Returns {bucket_index: (bias, avg_theo_prob, n)} — only for buckets
+        that clear `min_trades`, so a thin sample can't drive a correction.
+        bias = avg(settled_value) - avg(theo_prob) within that bucket: how
+        much to ADD to a raw theo_prob in that range to match realized
+        outcomes (negative = model is overconfident there).
+
+        Relies on orders.settled_value, which requires
+        reconcile_settled_values_from_outcomes() to have run — see that
+        method's docstring for why the naive fill/status-polling path used to
+        leave this permanently empty.
+        """
+        lookback_iso = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+        rows = self._conn.execute("""
+            SELECT theo_prob, settled_value FROM orders
+             WHERE action = 'buy'
+               AND fill_count > 0
+               AND settled_value IS NOT NULL
+               AND theo_prob IS NOT NULL
+               AND logged_at >= ?
+        """, (lookback_iso,)).fetchall()
+
+        n_buckets = len(bucket_edges) - 1
+        if n_buckets < 1:
+            return {}
+        theo_sums = [0.0] * n_buckets
+        settled_sums = [0.0] * n_buckets
+        counts = [0] * n_buckets
+
+        for theo_prob, settled_value in rows:
+            if theo_prob is None or settled_value is None:
+                continue
+            if theo_prob < bucket_edges[0] or theo_prob >= bucket_edges[-1]:
+                continue
+            idx = None
+            for i in range(n_buckets):
+                if bucket_edges[i] <= theo_prob < bucket_edges[i + 1]:
+                    idx = i
+                    break
+            if idx is None:
+                continue
+            theo_sums[idx] += theo_prob
+            settled_sums[idx] += settled_value
+            counts[idx] += 1
+
+        result: dict[int, tuple[float, float, int]] = {}
+        for i in range(n_buckets):
+            if counts[i] >= min_trades:
+                avg_theo = theo_sums[i] / counts[i]
+                avg_settled = settled_sums[i] / counts[i]
+                result[i] = (avg_settled - avg_theo, avg_theo, counts[i])
+        return result
 
     def get_slippage_factor(
         self,
@@ -1023,16 +1140,29 @@ class Store:
         """, (cycle_id, symbol)).fetchall()
 
     def get_unlabeled_market_tickers(self, before_iso: Optional[str] = None, limit: int = 100) -> list[str]:
+        """Tickers seen in market_snapshots with no market_outcomes row yet.
+
+        market_snapshots logs every strike scanned each cycle (rejected
+        candidates included), which vastly outnumbers tickers we actually
+        traded. With a flat `ORDER BY close_time ASC LIMIT 100`, a handful of
+        old tickers that never resolve (e.g. genuinely outside Kalshi's
+        historical-archive window) can occupy the front of that window on
+        every call and starve later tickers — including ones we hold real
+        positions in — from ever being attempted. Actually-traded tickers
+        (present in `orders`) are prioritized first so settlement data for
+        real money reaches self-calibration ahead of idle-scan noise.
+        """
         sql = """
             SELECT DISTINCT ms.ticker
               FROM market_snapshots ms
               LEFT JOIN market_outcomes mo ON mo.ticker = ms.ticker
              WHERE mo.ticker IS NULL
                AND ms.close_time < ?
+             ORDER BY (EXISTS (SELECT 1 FROM orders o WHERE o.ticker = ms.ticker)) DESC,
+                      ms.close_time ASC
+             LIMIT ?
         """
-        params: list[object] = [before_iso or _now_iso()]
-        sql += " ORDER BY ms.close_time ASC LIMIT ?"
-        params.append(limit)
+        params: list[object] = [before_iso or _now_iso(), limit]
         rows = self._conn.execute(sql, params).fetchall()
         return [str(r[0]) for r in rows]
 
