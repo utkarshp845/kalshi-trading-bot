@@ -257,20 +257,30 @@ def run(dry_run: bool) -> None:
 
 def _apply_calibration(store: Store) -> None:
     """
-    Log settled-trade calibration bias for visibility.
+    Log the coarse, whole-account settled-trade calibration bias once a day.
 
-    We do not mutate VOL_SAFETY_MARGIN here. Settled trade outcomes are a
-    selection-biased sample of only the contracts we chose to trade, and a
-    single global vol nudge moves YES/NO probabilities in different directions
-    across strikes. The market-implied IV/RV margin remains the only automatic
-    volatility calibration mechanism.
+    This does NOT mutate VOL_SAFETY_MARGIN — a single global vol nudge moves
+    YES/NO probabilities in different directions across strikes, and this
+    number mixes every probability bucket together, which is exactly what
+    hid the 2026-08-10 miscalibration (the 0.70-0.90 bucket was badly broken
+    while 0.30-0.70 was fine; the blended average looked much less alarming
+    than either bucket alone). The market-implied IV/RV margin remains the
+    only thing that adjusts sigma automatically.
+
+    The actual per-trade correction now lives in
+    Store.get_settlement_calibration_by_bucket() /
+    feature_builder._calibrate_prob(), applied every cycle at the probability
+    level, gated per-bucket on CALIBRATION_MIN_TRADES_PER_BUCKET. This
+    function is only a coarse daily summary log.
     """
     bias = store.get_prob_calibration_bias(min_trades=10, lookback_days=30)
     if bias is None:
         log.info("Calibration: insufficient settled trades — using static VOL_SAFETY_MARGIN=%.3f", cfg.VOL_SAFETY_MARGIN)
         return
     log.info(
-        "Calibration: prob_bias=%.4f (informational only; VOL_SAFETY_MARGIN unchanged at %.3f)",
+        "Calibration: whole-account prob_bias=%.4f (coarse summary only — see per-cycle "
+        "'Calibration bucket' log lines for the correction actually being applied; "
+        "VOL_SAFETY_MARGIN unchanged at %.3f)",
         bias, cfg.VOL_SAFETY_MARGIN,
     )
 
@@ -587,6 +597,23 @@ def _build_cycle_assets(
     assets: dict[str, AssetSnapshot] = {}
     features_by_symbol: dict[str, list] = {}
     total_markets = 0
+
+    calibration: dict[int, tuple[float, float, int]] = {}
+    if cfg.ENABLE_SETTLEMENT_CALIBRATION:
+        calibration = store.get_settlement_calibration_by_bucket(
+            bucket_edges=cfg.CALIBRATION_BUCKET_EDGES,
+            min_trades=cfg.CALIBRATION_MIN_TRADES_PER_BUCKET,
+            lookback_days=cfg.CALIBRATION_LOOKBACK_DAYS,
+        )
+        if calibration:
+            for idx, (bias, avg_theo, n) in sorted(calibration.items()):
+                lo, hi = cfg.CALIBRATION_BUCKET_EDGES[idx], cfg.CALIBRATION_BUCKET_EDGES[idx + 1]
+                capped = max(-cfg.CALIBRATION_MAX_HAIRCUT, min(cfg.CALIBRATION_MAX_HAIRCUT, bias))
+                log.info(
+                    "Calibration bucket [%.2f-%.2f): n=%d avg_theo=%.3f bias=%+.3f (applied=%+.3f)",
+                    lo, hi, n, avg_theo, bias, capped,
+                )
+
     for symbol, series in _enabled_underlyings():
         try:
             price_result = fetch_price_snapshot(
@@ -625,6 +652,7 @@ def _build_cycle_assets(
                 asset, markets_result.markets,
                 fee=cfg.KALSHI_TAKER_FEE,
                 maker_entry=cfg.ENABLE_MAKER_ORDERS,
+                calibration=calibration,
             )
             features_by_symbol[symbol] = features
             total_markets += len(markets_result.markets)
@@ -1082,6 +1110,14 @@ def _run_cycle(kalshi: KalshiClient, risk: DailyRisk, store: Store, dry_run: boo
 
     # --- Fill quality check ---
     _backfill_market_outcomes(kalshi, store, before_iso=cycle_id)
+    # Propagate any newly-known outcomes straight into orders.settled_value.
+    # Decoupled from _check_fills()/get_unfilled_orders() below, which only
+    # ever revisits orders it still considers "recent" — a known-outcome
+    # market should update every matching order regardless of that order's
+    # own polled status or age (see reconcile_settled_values_from_outcomes).
+    _reconciled = store.reconcile_settled_values_from_outcomes()
+    if _reconciled:
+        log.info("Settlement reconcile: %d order(s) newly labeled from market_outcomes", _reconciled)
     _t_backfill = time.monotonic()
     _check_fills(kalshi, store)
     _t_fills = time.monotonic()

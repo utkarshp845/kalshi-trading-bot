@@ -132,6 +132,26 @@ DEFAULT_MAKER_FILL_PROB: float = _float("DEFAULT_MAKER_FILL_PROB", 0.50)
 MIN_EFFECTIVE_MAKER_FILL_PROB: float = _float("MIN_EFFECTIVE_MAKER_FILL_PROB", 0.15)  # floor applied to maker_fill_prob when scoring, only while ENABLE_TAKER_ESCALATION is on — a measured 0% maker fill rate isn't a lost trade in that regime (it escalates to taker), so it must not multiply raw_score to zero and kill every signal outright
 MAKER_MISS_PENALTY: float = _float("MAKER_MISS_PENALTY", 0.005)  # was 0.01 — a missed maker fill costs nothing but time; don't let it sink marginal signals
 
+# --- Settlement-based probability calibration ---
+# _apply_calibration() in main.py logged AVG(settled_value - theo_prob) as
+# "informational only" for a long time: a single global nudge to the vol
+# margin moves YES/NO probabilities in opposite directions across strikes, so
+# it was deliberately not auto-applied. But real settlement data (2026-08-10
+# incident review) showed the miscalibration is bucket-specific and severe —
+# the 0.70-0.90 "favorite" bucket ran a 0% real win rate against an 82%
+# modeled probability on the first 15 verified trades. This applies a
+# per-bucket haircut directly to contract_theo_prob, gated on a minimum
+# sample size per bucket so a handful of settlements can't swing sizing.
+# Buckets align with THEO_PROB_BAND_MIN/MAX; the two interior edges split off
+# the near-ATM range that historically calibrated closer to reality.
+ENABLE_SETTLEMENT_CALIBRATION: bool = _bool("ENABLE_SETTLEMENT_CALIBRATION", True)
+CALIBRATION_BUCKET_EDGES: tuple[float, ...] = (0.05, 0.30, 0.70, 0.90)
+CALIBRATION_MIN_TRADES_PER_BUCKET: int = _int("CALIBRATION_MIN_TRADES_PER_BUCKET", 15)
+CALIBRATION_LOOKBACK_DAYS: int = _int("CALIBRATION_LOOKBACK_DAYS", 45)
+# Cap how far any single bucket's correction can move a probability — a
+# safety rail against a still-thin or unlucky sample overcorrecting.
+CALIBRATION_MAX_HAIRCUT: float = _float("CALIBRATION_MAX_HAIRCUT", 0.35)
+
 # --- Risk ---
 DAILY_SPEND_PCT: float = _float("DAILY_SPEND_PCT", 0.30)      # was 0.15 — aggressive: up to 30% of balance per day
 DAILY_SPEND_FLOOR: float = _float("DAILY_SPEND_FLOOR", 10.0)  # minimum daily cap regardless of balance

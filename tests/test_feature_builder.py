@@ -4,7 +4,7 @@ from typing import Optional
 
 import pytest
 
-from bot.feature_builder import build_asset_snapshot, build_market_features
+from bot.feature_builder import _calibrate_prob, build_asset_snapshot, build_market_features
 from bot.kalshi_client import OrderbookSnapshot
 from bot.models import SourceSnapshot
 from tests.conftest import make_market
@@ -109,6 +109,69 @@ def test_market_features_include_orderbook_depth_metrics():
     assert feature.expected_fill_price == pytest.approx(0.45)
     assert feature.depth_slippage == pytest.approx(0.0)
     assert feature.orderbook_imbalance == pytest.approx(0.5)
+
+
+class TestCalibratePob:
+    BUCKET_EDGES = (0.05, 0.30, 0.70, 0.90)
+
+    def test_passthrough_when_no_calibration_data(self):
+        assert _calibrate_prob(0.82, None, self.BUCKET_EDGES, 0.35) == 0.82
+        assert _calibrate_prob(0.82, {}, self.BUCKET_EDGES, 0.35) == 0.82
+
+    def test_passthrough_when_bucket_has_no_entry(self):
+        # only bucket 0 (0.05-0.30) has enough history; 0.82 falls in bucket 2
+        calibration = {0: (-0.05, 0.15, 20)}
+        assert _calibrate_prob(0.82, calibration, self.BUCKET_EDGES, 0.35) == 0.82
+
+    def test_passthrough_outside_band(self):
+        calibration = {0: (-0.5, 0.15, 20), 2: (-0.5, 0.82, 20)}
+        assert _calibrate_prob(0.02, calibration, self.BUCKET_EDGES, 0.35) == 0.02
+        assert _calibrate_prob(0.95, calibration, self.BUCKET_EDGES, 0.35) == 0.95
+
+    def test_applies_negative_bias_for_overconfident_bucket(self):
+        # matches the real incident: 0.70-0.90 bucket modeled ~0.82, real win rate 0.0
+        calibration = {2: (-0.57, 0.82, 15)}
+        corrected = _calibrate_prob(0.82, calibration, self.BUCKET_EDGES, 0.35)
+        # bias magnitude is capped at max_haircut so a thin/extreme sample
+        # can't swing probability by more than the configured rail
+        assert corrected == pytest.approx(0.82 - 0.35)
+
+    def test_uncapped_bias_within_haircut_applies_fully(self):
+        calibration = {1: (-0.10, 0.58, 18)}
+        corrected = _calibrate_prob(0.58, calibration, self.BUCKET_EDGES, 0.35)
+        assert corrected == pytest.approx(0.48)
+
+    def test_result_clamped_to_valid_probability_range(self):
+        calibration = {0: (-0.9, 0.10, 20)}
+        corrected = _calibrate_prob(0.10, calibration, self.BUCKET_EDGES, 0.99)
+        assert corrected == 0.0
+
+
+def test_build_market_features_applies_calibration_to_theo_prob():
+    asset = build_asset_snapshot(
+        symbol="BTC",
+        series_ticker="KXBTC",
+        price_result=_PriceResult(_source("kraken", "BTC"), 95000.0, 0.60, 0.55, 0.0),
+        markets_result=_MarketsResult(_source("kalshi", "BTC"), []),
+        iv_result=_IVResult(_source("deribit", "BTC"), 0.65),
+        store=_Store(),
+        open_positions=0,
+    )
+    market = make_market(ticker="KXBTC-26APR4PM-B95000", yes_ask=0.45, yes_bid=0.42, no_ask=0.58, no_bid=0.55)
+
+    uncalibrated = build_market_features(asset, [market], fee=0.07)[0]
+    # Force a large negative correction on whatever bucket this contract's
+    # raw theo_prob lands in, across the whole band, to prove it takes effect.
+    calibration = {
+        0: (-0.30, 0.15, 20),
+        1: (-0.30, 0.50, 20),
+        2: (-0.30, 0.80, 20),
+    }
+    calibrated = build_market_features(asset, [market], fee=0.07, calibration=calibration)[0]
+
+    assert calibrated.contract_theo_prob == pytest.approx(uncalibrated.contract_theo_prob - 0.30, abs=1e-6)
+    # edge must be recomputed off the calibrated probability, not the raw one
+    assert calibrated.edge < uncalibrated.edge
 
 
 def test_market_features_maker_entry_uses_bid_and_maker_fee():
